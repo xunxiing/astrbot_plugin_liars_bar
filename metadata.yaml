@@ -1,6 +1,25 @@
-name: helloworld # 这是你的插件的唯一识别名。
-desc: 这是 AstrBot 的默认插件，支持关键词回复。 # 插件简短描述
-help: 输入 /keyword 查看关键词回复帮助。 # 插件的帮助信息
-version: v1.3 # 插件版本号。格式：v1.1.1 或者 v1.1
-author: Soulter # 作者
-repo: https://github.com/Soulter/helloworld # 插件的仓库地址
+# metadata.yaml
+
+# 插件的唯一标识符 (必须与 main.py 中 @register 的第一个参数一致)
+name: liar_tavern
+
+# 插件作者的名字或昵称
+author: xunxi  # 请替换成你自己的名字
+
+# 插件的版本号 (建议遵循语义化版本规范, 如 1.0.0)
+version: 1.0.0
+
+# 插件功能的简短描述
+description: 一个在QQ群里玩骗子酒馆的AstrBot插件
+
+# (可选但推荐) 插件代码仓库的 URL 地址
+repo: https://github.com/xunxiing/astrbot_plugin_liars_bar.git # 替换成你实际的仓库地址，如果没有可以不填或留空
+
+# (可选) 插件的标签，方便分类 (这是一个示例，可以根据需要添加)
+# tags:
+#   - game
+#   - fun
+#   - social
+
+# (可选) 要求的 AstrBot 最低版本
+# requires_astrbot_version: ">=1.5.0"
