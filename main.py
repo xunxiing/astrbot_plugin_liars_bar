@@ -1,4 +1,4 @@
-# main.py - 左轮扑克 (骗子酒馆规则变体) - v2.1.9 文本优化 & Bug修复
+# main.py - 左轮扑克 (骗子酒馆规则变体) - v2.2.0 文本优化 & Bug修复
 import random
 import re # 引入正则表达式库
 from typing import Dict, List, Set, Any, Tuple
@@ -6,6 +6,7 @@ from collections import Counter
 
 # --- 从 astrbot.api 导入所需组件 ---
 from astrbot.api import logger  # <--- 直接导入 AstrBot 的 logger
+from astrbot.api import AstrBotConfig # <--- 新增导入
 import astrbot.api.message_components as Comp
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star, register
@@ -18,17 +19,17 @@ CARDS_PER_TYPE = 10 # <-- 增加目标牌数量 (原为 6)
 # JOKER_COUNT 动态计算
 HAND_SIZE = 5
 GUN_CHAMBERS = 6
-LIVE_BULLETS = 2 # <-- 调整实弹数量以降低空枪率 (原为 1) -> P(空)=2/6=66.7% P(实)=4/6=33.3%
+#LIVE_BULLETS = 2 # <-- 调整实弹数量以降低空枪率 (原为 1) -> P(空)=2/6=66.7% P(实)=4/6=33.3%
 MIN_PLAYERS = 2
 
 # --- 插件注册 ---
 @register("liar_tavern", "骗子酒馆助手", "左轮扑克 (骗子酒馆规则变体)", "2.1.9", "https://github.com/xunxiing/astrbot_plugin_liars_bar") # 更新版本号
 class LiarsPokerPlugin(Star):
-    def __init__(self, context: Context):
+    def __init__(self, context: Context, config: AstrBotConfig): # <--- 修改了这里，添加了 config 参数
         super().__init__(context)
+        self.config = config # <--- 新增这行，保存配置对象
         self.games: Dict[str, Dict] = {}
-        # 现在可以直接使用导入的 logger
-        logger.info("LiarsPokerPlugin (左轮扑克) 初始化完成。")
+        logger.info("LiarsPokerPlugin (左轮扑克) 初始化完成。配置已加载。") # <--- 可以稍微修改日志信息
 
     # --- 辅助函数 (使用导入的 logger) ---
     def _get_group_id(self, event: AstrMessageEvent) -> str | None:
@@ -280,19 +281,40 @@ class LiarsPokerPlugin(Star):
     # --- (已有代码: _initialize_gun 等) ---
 
     # --- 游戏设置函数 ---
-    def _initialize_gun(self) -> Tuple[List[str], int]:
-        # 使用更新后的 LIVE_BULLETS 常量
-        live_count = LIVE_BULLETS
-        empty_count = GUN_CHAMBERS - live_count
-        if empty_count < 0: # 防止配置错误
-             logger.error(f"实弹数({live_count}) 大于弹巢数({GUN_CHAMBERS})，重置为空弹数=1")
-             empty_count = 1
-             live_count = GUN_CHAMBERS - 1
+    # --- 游戏设置函数 ---
+    def _initialize_gun(self) -> Tuple[List[str], int]: # 确认是实例方法 (有 self)
+    # --- 修改开始 ---
+    # 直接在这里读取配置，并提供默认值
+        try:
+            # 现在 self.config 是由框架传入的 AstrBotConfig 对象
+            # .get() 方法仍然有效，且框架会根据 _conf_schema.json 处理默认值
+            config_empty_bullets = self.config.get("empty_bullet_count", 4) # 这里基本不用改
+            # 确保是整数
+            config_empty_bullets = int(config_empty_bullets)
+        except (AttributeError, ValueError, TypeError) as e: # 保留类型转换错误处理
+           # AttributeError 理论上不应再发生，因为框架保证传入 config
+           logger.error(f"读取或转换配置 'empty_bullet_count' 时出错: {e}，将使用默认空弹数 4。")
+           config_empty_bullets = 4 # 最终的保险默认值
 
+        # ... (_initialize_gun 的其余部分保持不变) ...
+        # 确保配置值在合理范围内
+        if config_empty_bullets >= GUN_CHAMBERS:
+           logger.warning(f"配置的空弹数 ({config_empty_bullets}) 大于或等于弹巢数 ({GUN_CHAMBERS})，强制设置为 {GUN_CHAMBERS - 1} 个空弹。")
+           config_empty_bullets = GUN_CHAMBERS - 1
+        elif config_empty_bullets < 0:
+           logger.warning(f"配置的空弹数 ({config_empty_bullets}) 不能为负，强制设置为 0 个空弹。")
+           config_empty_bullets = 0
+        # ... (计算 live_count, bullets 等保持不变) ...
+        live_count = GUN_CHAMBERS - empty_count
+        if live_count <= 0:
+           logger.warning(f"配置导致实弹数小于等于0 (空弹: {empty_count})，强制调整为 1 实弹, {GUN_CHAMBERS - 1} 空弹")
+           live_count = 1
+           empty_count = GUN_CHAMBERS - 1
         bullets = ["空弹"] * empty_count + ["实弹"] * live_count
         random.shuffle(bullets)
-        logger.info(f"初始化枪械: {live_count}实弹, {empty_count}空弹")
+        logger.info(f"最终初始化枪械: {live_count}实弹, {empty_count}空弹 (基于配置)")
         return bullets, 0
+    # --- 修改结束 ---
 
     def _build_deck(self, player_count: int) -> List[str]:
         deck = []
@@ -465,7 +487,28 @@ class LiarsPokerPlugin(Star):
         game["status"] = "playing"
         game["last_play"] = None
         game["discard_pile"] = []
-        logger.info(f"[群{group_id}] 游戏开始! 主牌: {game['main_card']}, 顺序: {[game['players'][pid]['name'] for pid in game['turn_order']]}, 动态小丑牌: {player_count // 2}, 实弹数: {LIVE_BULLETS}")
+
+        # --- 修改日志记录开始 ---
+        # 在这里重新读取配置，计算出将要使用的弹药数，用于日志记录
+        try:
+            # 同样，使用框架传入的 self.config
+            log_empty_bullets = int(self.config.get("empty_bullet_count", 4)) # 这里基本不用改
+            # 进行范围验证
+            if log_empty_bullets >= GUN_CHAMBERS:
+                log_empty_bullets = GUN_CHAMBERS - 1
+            elif log_empty_bullets < 0:
+                log_empty_bullets = 0
+        except (AttributeError, ValueError, TypeError) as e: # 保留类型转换错误处理
+             logger.error(f"读取或转换配置 'empty_bullet_count' 用于日志时出错: {e}，将使用默认空弹数 4。")
+             log_empty_bullets = 4 # 日志出错时使用默认值
+
+        # ... (计算 log_live_bullets 和日志打印部分保持不变) ...
+        log_live_bullets = GUN_CHAMBERS - log_empty_bullets
+        if log_live_bullets <= 0:
+            log_live_bullets = 1
+            log_empty_bullets = GUN_CHAMBERS - 1 # 相应调整空弹数
+        logger.info(f"[群{group_id}] 游戏开始! 主牌: {game['main_card']}, 顺序: {[game['players'][pid]['name'] for pid in game['turn_order']]}, 动态小丑牌: {player_count // 2}, 实弹数: {log_live_bullets} (空弹数: {log_empty_bullets}, 据配置)")
+        
 
         pm_failed_players = []
         for player_id in player_ids:
