@@ -1,4 +1,4 @@
-# main.py - 左轮扑克 (骗子酒馆规则变体) - v2.1.8 平衡性调整 & Bug修复
+# main.py - 左轮扑克 (骗子酒馆规则变体) - v2.1.9 文本优化 & Bug修复
 import random
 import re # 引入正则表达式库
 from typing import Dict, List, Set, Any, Tuple
