@@ -13,7 +13,7 @@ version: 2.1.9
 description: 一个在QQ群里玩骗子酒馆的AstrBot插件
 
 # (可选但推荐) 插件代码仓库的 URL 地址
-repo: https://github.com/xunxiing/astrbot_plugin_liars_bar.git # 替换成你实际的仓库地址，如果没有可以不填或留空
+repo: https://github.com/xunxiing/astrbot_plugin_liars_bar # 替换成你实际的仓库地址，如果没有可以不填或留空
 
 # (可选) 插件的标签，方便分类 (这是一个示例，可以根据需要添加)
 # tags:
