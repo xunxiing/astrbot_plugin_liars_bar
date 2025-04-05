@@ -7,7 +7,7 @@ name: liar_tavern
 author: xunxi  # 请替换成你自己的名字
 
 # 插件的版本号 (建议遵循语义化版本规范, 如 1.0.0)
-version: 1.0.0
+version: 2.1.9
 
 # 插件功能的简短描述
 description: 一个在QQ群里玩骗子酒馆的AstrBot插件
