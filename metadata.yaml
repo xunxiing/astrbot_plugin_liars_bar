@@ -7,7 +7,7 @@ name: liar_tavern
 author: xunxi  # 请替换成你自己的名字
 
 # 插件的版本号 (建议遵循语义化版本规范, 如 1.0.0)
-version: 2.1.9
+version: 2.2.0
 
 # 插件功能的简短描述
 description: 一个在QQ群里玩骗子酒馆的AstrBot插件
@@ -23,3 +23,5 @@ repo: https://github.com/xunxiing/astrbot_plugin_liars_bar # 替换成你实际�
 
 # (可选) 要求的 AstrBot 最低版本
 # requires_astrbot_version: ">=1.5.0"
+
+# --- 添加配置项 ---
