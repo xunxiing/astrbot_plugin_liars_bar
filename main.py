@@ -767,7 +767,7 @@ class LiarsPokerPlugin(Star):
             current_player_at = Comp.At(qq=current_player_id)
         else:
             logger.warning(f"状态查询时 current_player_index 无效: {game['current_player_index']}")
-        player_statuses = [f"- {pdata['name']}: {'淘汰' if pdata.get('is_eliminated') else f"{len(pdata.get('hand', []))}张牌"}" for pid, pdata in game["players"].items()]
+        player_statuses = [f"- {pdata['name']}: {'淘汰' if pdata.get('is_eliminated') else str(len(pdata.get('hand', []))) + '张牌'}" for pid, pdata in game["players"].items()]
         last_play_text = "无"
         if game["last_play"]:
              last_player_name = game["players"][game["last_play"]["player_id"]]["name"]
