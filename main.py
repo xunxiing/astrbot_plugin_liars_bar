@@ -22,7 +22,7 @@ LIVE_BULLETS = 2 # <-- 调整实弹数量以降低空枪率 (原为 1) -> P(空)
 MIN_PLAYERS = 2
 
 # --- 插件注册 ---
-@register("liar_tavern", "骗子酒馆助手", "左轮扑克 (骗子酒馆规则变体)", "2.1.9", "https://github.com/xunxiing/astrbot_plugin_liars_bar") # 更新版本号
+@register("liar_tavern", "骗子酒馆助手", "左轮扑克 (骗子酒馆规则变体)", "2.2.0", "https://github.com/xunxiing/astrbot_plugin_liars_bar") # 更新版本号
 class LiarsPokerPlugin(Star):
     def __init__(self, context: Context):
         super().__init__(context)
