@@ -1,9 +1,0 @@
-{
-    "empty_bullet_count": {
-      "type": "int",
-      "description": "左轮手枪中的空弹数量",
-      "default": 4,
-      "hint": "请输入 0 到 5 之间的整数。弹巢总数为 6，插件会确保至少有1发实弹。"
-    }
-  }
-  
