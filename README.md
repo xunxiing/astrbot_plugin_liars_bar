@@ -85,7 +85,7 @@
 
 ## 贡献
 
-欢迎通过提 Issue 或 Pull Request (如果提供了仓库链接) 的方式贡献代码、报告 Bug 或提出建议。
+欢迎通过提 Issue 或 Pull Request (https://github.com/xunxiing/astrbot_plugin_liars_bar.git)的方式贡献代码、报告 Bug 或提出建议。
 
 ## 许可证
 
