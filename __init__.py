@@ -1,16 +1,6 @@
-# __init__.py - 包标识文件，导入核心类
-from .game_logic import LiarsTavernGame
-from .models import GameState, GameEvent, Player, GameConfig
-from .exceptions import GameError, InvalidActionError, InvalidPlayerError
+# -*- coding: utf-8 -*-
+# This file makes Python treat the directory liar_tavern as a package.
 
-__all__ = [
-    'LiarsTavernGame',
-    'GameState',
-    'GameEvent',
-    'Player',
-    'GameConfig',
-    'GameError',
-    'InvalidActionError',
-    'InvalidPlayerError'
-]
-
+# Optionally, you can import key classes for easier access from outside
+# from .main import LiarDicePlugin
+# from .game_logic import LiarDiceGame
