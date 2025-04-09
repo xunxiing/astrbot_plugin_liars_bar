@@ -1,671 +1,372 @@
+# 请将这段代码完整粘贴到 game_logic.py 文件中 (已添加更多日志用于调试)
+
+# liar_tavern/game_logic.py
+
+# -*- coding: utf-8 -*-
+
 import random
-from typing import Dict, List, Set, Any, Tuple, Callable, Optional
-from collections import Counter
+import logging
+from typing import List, Dict, Optional, Tuple, Any
+import math
 
-from .models import Player, GameState, GameConfig, GameEvent, CardType
-from .exceptions import GameError, InvalidActionError, InvalidPlayerError
+# Import models and exceptions
+from .models import (
+    GameState, PlayerData, GameStatus, LastPlay, ShotResult, ChallengeResult,
+    HAND_SIZE, CARD_TYPES_BASE, JOKER, MAX_PLAY_CARDS, MIN_PLAYERS,
+    initialize_gun
+)
+from .exceptions import (
+    GameError, PlayerNotInGameError, NotPlayersTurnError, InvalidCardIndexError,
+    InvalidPlayQuantityError, NoChallengeTargetError, EmptyHandError, InvalidActionError,
+    PlayerAlreadyJoinedError, GameNotWaitingError, GameNotPlayingError,
+    NotEnoughPlayersError
+)
 
-class LiarsTavernGame:
-    """骗子酒馆游戏核心逻辑类"""
-    
-    def __init__(self, game_id: str, config: GameConfig = None):
-        """
-        初始化一个新的游戏实例
-        
-        Args:
-            game_id: 游戏唯一标识符（通常是群ID）
-            config: 游戏配置，如果为None则使用默认配置
-        """
-        self.game_id = game_id
-        self.config = config or GameConfig()
-        self.state = GameState.WAITING
-        self.players: Dict[str, Player] = {}
-        self.turn_order: List[str] = []
-        self.current_player_index: int = -1
-        self.main_card: str = None
-        self.last_play: Dict = None
-        self.discard_pile: List[str] = []
-        self.deck: List[str] = []
-        
-        # 事件回调函数
-        self.event_callbacks: Dict[GameEvent, List[Callable]] = {event: [] for event in GameEvent}
-    
-    def register_callback(self, event: GameEvent, callback: Callable) -> None:
-        """注册事件回调函数"""
-        if event in self.event_callbacks:
-            self.event_callbacks[event].append(callback)
-    
-    def _trigger_event(self, event: GameEvent, **kwargs) -> None:
-        """触发事件，调用所有注册的回调函数"""
-        for callback in self.event_callbacks.get(event, []):
-            callback(self, **kwargs)
-    
-    def add_player(self, player_id: str, player_name: str) -> bool:
-        """
-        添加玩家到游戏
-        
-        Args:
-            player_id: 玩家ID
-            player_name: 玩家名称
-            
-        Returns:
-            bool: 是否成功添加
-            
-        Raises:
-            GameError: 如果游戏状态不是等待中
-            InvalidPlayerError: 如果玩家已经在游戏中
-        """
-        if self.state != GameState.WAITING:
-            raise GameError("游戏已经开始或结束，无法加入")
-        
-        if player_id in self.players:
-            raise InvalidPlayerError(f"玩家 {player_name} 已经加入了游戏")
-        
-        # 初始化枪械
-        gun, gun_pos = self._initialize_gun()
-        
-        # 创建玩家
-        player = Player(
-            id=player_id,
-            name=player_name,
-            hand=[],
-            gun=gun,
-            gun_position=gun_pos,
-            is_eliminated=False
-        )
-        
-        self.players[player_id] = player
-        self._trigger_event(GameEvent.PLAYER_JOINED, player=player)
-        return True
-    
-    def start_game(self) -> bool:
-        """
-        开始游戏
-        
-        Returns:
-            bool: 是否成功开始游戏
-            
-        Raises:
-            GameError: 如果游戏状态不是等待中或玩家数量不足
-        """
-        if self.state != GameState.WAITING:
-            raise GameError("游戏已经开始或结束")
-        
-        player_ids = list(self.players.keys())
-        player_count = len(player_ids)
-        
-        if player_count < self.config.MIN_PLAYERS:
-            raise GameError(f"至少需要 {self.config.MIN_PLAYERS} 名玩家才能开始游戏，当前只有 {player_count} 人")
-        
-        # 构建牌堆
-        self.deck = self._build_deck(player_count)
-        self.main_card = self._determine_main_card()
-        
-        # 发牌
-        self._deal_cards(self.deck, player_ids)
-        
-        # 确定玩家顺序
-        self.turn_order = random.sample(player_ids, len(player_ids))
-        self.current_player_index = 0
-        self.state = GameState.PLAYING
-        self.last_play = None
-        self.discard_pile = []
-        
-        self._trigger_event(GameEvent.GAME_STARTED, 
-                           main_card=self.main_card, 
-                           turn_order=self.turn_order,
-                           first_player_id=self.turn_order[0])
-        return True
-    
-    def _initialize_gun(self) -> Tuple[List[str], int]:
-        """初始化枪械，返回弹巢和初始位置"""
-        live_count = self.config.LIVE_BULLETS
-        empty_count = self.config.GUN_CHAMBERS - live_count
-        
-        if empty_count < 0:
-            empty_count = 1
-            live_count = self.config.GUN_CHAMBERS - 1
-        
-        bullets = ["空弹"] * empty_count + ["实弹"] * live_count
-        random.shuffle(bullets)
-        return bullets, 0
-    
-    def _build_deck(self, player_count: int) -> List[str]:
-        """构建牌堆"""
-        deck = []
-        for card_type in self.config.CARD_TYPES:
-            deck.extend([card_type] * self.config.CARDS_PER_TYPE)
-        
-        joker_count = player_count // 2
-        deck.extend([self.config.JOKER] * joker_count)
-        return deck
-    
-    def _determine_main_card(self) -> str:
-        """确定主牌"""
-        return random.choice(self.config.CARD_TYPES)
-    
-    def _deal_cards(self, deck: List[str], player_ids: List[str]) -> None:
-        """发牌给玩家"""
-        current_deck = list(deck)
-        random.shuffle(current_deck)
-        
-        for player_id in player_ids:
-            hand = []
-            for _ in range(self.config.HAND_SIZE):
-                if current_deck:
-                    hand.append(current_deck.pop())
-                else:
-                    break
-            self.players[player_id].hand = hand
-            
-            self._trigger_event(GameEvent.CARDS_DEALT, 
-                               player_id=player_id, 
-                               hand=hand, 
-                               main_card=self.main_card)
-    
-    def get_current_player(self) -> Optional[Player]:
-        """获取当前玩家"""
-        if self.state != GameState.PLAYING:
-            return None
-        
-        if 0 <= self.current_player_index < len(self.turn_order):
-            current_player_id = self.turn_order[self.current_player_index]
-            return self.players.get(current_player_id)
-        
-        return None
-    
-    def get_active_players(self) -> List[str]:
-        """获取所有活跃（未被淘汰）的玩家ID"""
-        return [pid for pid, player in self.players.items() 
-                if not player.is_eliminated]
-    
-    def get_next_player_index(self) -> int:
-        """获取下一个玩家的索引"""
-        if self.state != GameState.PLAYING:
-            return -1
-        
-        current_index = self.current_player_index
-        turn_order = self.turn_order
-        num_players = len(turn_order)
-        
-        if num_players == 0:
-            return -1
-        
-        next_index = (current_index + 1) % num_players
-        active_player_found = False
-        
-        for _ in range(num_players):
-            if not self.players[turn_order[next_index]].is_eliminated:
-                active_player_found = True
-                break
-            next_index = (next_index + 1) % num_players
-        
-        if not active_player_found:
-            return -1
-            
-        return next_index
-    
-    def play_cards(self, player_id: str, card_indices: List[int]) -> bool:
-        """
-        玩家出牌
-        
-        Args:
-            player_id: 玩家ID
-            card_indices: 要出的牌的索引（基于1）
-            
-        Returns:
-            bool: 是否成功出牌
-            
-        Raises:
-            GameError: 如果游戏状态不是进行中
-            InvalidPlayerError: 如果不是当前玩家的回合
-            InvalidActionError: 如果出牌无效
-        """
-        if self.state != GameState.PLAYING:
-            raise GameError("游戏未在进行中")
-        
-        current_player_id = self.turn_order[self.current_player_index]
-        if player_id != current_player_id:
-            raise InvalidPlayerError("还没轮到你")
-        
-        player = self.players[player_id]
-        
-        # 检查手牌是否为空
-        if not player.hand:
-            raise InvalidActionError("你手牌已空，无法出牌")
-        
-        # 验证索引
-        indices_0based = [i - 1 for i in card_indices]
-        hand_size = len(player.hand)
-        
+logger = logging.getLogger(__name__)
+
+class LiarDiceGame:
+    """Encapsulates the state and logic for a single game instance."""
+
+    def __init__(self, creator_id: Optional[str] = None):
+        self.state = GameState(status=GameStatus.WAITING, creator_id=creator_id)
+        logger.debug("New LiarDiceGame instance created.")
+
+    def add_player(self, player_id: str, player_name: str) -> None:
+        """Adds a player to the game during the WAITING phase."""
+        if self.state.status != GameStatus.WAITING:
+             raise GameNotWaitingError(f"游戏正在进行({self.state.status.name})，无法加入。")
+        if player_id in self.state.players:
+            logger.warning(f"Player {player_name}({player_id}) attempted to join again (ignored).")
+            return
+        gun_bullets, gun_pos = initialize_gun()
+        self.state.players[player_id] = PlayerData(id=player_id, name=player_name, gun=gun_bullets, gun_position=gun_pos)
+        logger.info(f"Player {player_name}({player_id}) added. Total players: {len(self.state.players)}")
+
+    def start_game(self) -> Dict[str, Any]:
+        """Starts the game, deals cards, determines turn order."""
+        if self.state.status != GameStatus.WAITING: raise InvalidActionError("游戏未处于等待状态。")
+        if len(self.state.players) < MIN_PLAYERS: raise NotEnoughPlayersError(f"至少需要 {MIN_PLAYERS} 人才能开始。")
+
+        player_ids = list(self.state.players.keys()); player_count = len(player_ids)
+        self.state.main_card = random.choice(CARD_TYPES_BASE); logger.info(f"Game starting. Main card: {self.state.main_card}")
+        self.state.deck = self._build_deck(player_count)
+        logger.debug(f"Built deck ({len(self.state.deck)} cards)")
+        try: self._deal_cards_new_rule()
+        except ValueError as e: logger.error(f"Dealing failed: {e}"); raise GameError(f"发牌失败: {e}")
+        except IndexError as e: logger.error(f"Dealing failed with IndexError: {e}", exc_info=True); raise GameError(f"发牌失败: 内部索引错误，请检查逻辑。")
+
+        self.state.turn_order = random.sample(player_ids, player_count)
+        self.state.current_player_index = 0; self.state.status = GameStatus.PLAYING; self.state.last_play = None; self.state.discard_pile = []; self.state.round_start_reason = "游戏开始"
+        logger.info(f"Game started. Order: {[self.state.players[pid].name for pid in self.state.turn_order]}")
+
+        initial_hands = {pid: pdata.hand for pid, pdata in self.state.players.items()}
+        current_player_id = self.get_current_player_id(); current_player_name = self.get_current_player_name()
+        return {"success": True, "main_card": self.state.main_card, "turn_order_names": [self.state.players[pid].name for pid in self.state.turn_order], "initial_hands": initial_hands, "first_player_id": current_player_id, "first_player_name": current_player_name }
+
+    def process_play_card(self, player_id: str, card_indices_1based: List[int]) -> Dict[str, Any]:
+        """Processes a player's card play action with validation."""
+        self._check_is_playing(); self._check_player_turn(player_id)
+        player_data = self.state.players[player_id]; hand_size = len(player_data.hand)
+        if not hand_size > 0: raise EmptyHandError("手牌为空，无法出牌。")
+
+        num_indices_provided = len(card_indices_1based)
+        if not (1 <= num_indices_provided <= MAX_PLAY_CARDS): raise InvalidPlayQuantityError(f"每次出牌需提供 1 到 {MAX_PLAY_CARDS} 个有效编号，您提供了 {num_indices_provided} 个。")
+        if len(card_indices_1based) != len(set(card_indices_1based)): raise InvalidCardIndexError("出牌编号不能重复。")
+
+        indices_0based = [i - 1 for i in card_indices_1based]
         invalid_indices = [i + 1 for i in indices_0based if i < 0 or i >= hand_size]
-        if invalid_indices:
-            raise InvalidActionError(f"无效的编号: {', '.join(map(str, invalid_indices))}。你的手牌只有 {hand_size} 张 (编号 1 到 {hand_size})")
-        
-        # 检查出牌数量
-        if not (1 <= len(card_indices) <= 3):
-            raise InvalidActionError("出牌数量必须是 1 到 3 张")
-        
-        # 检查是否有重复索引
-        if len(indices_0based) != len(set(indices_0based)):
-            raise InvalidActionError("出牌编号不能重复")
-        
-        # 处理上一轮出牌
-        if self.last_play:
-            accepted_cards = self.last_play["actual_cards"]
-            self.discard_pile.extend(accepted_cards)
-            self.last_play = None
-        
-        # 执行出牌
-        cards_to_play = [player.hand[i] for i in indices_0based]
-        new_hand = []
-        indices_played_set = set(indices_0based)
-        
-        for i, card in enumerate(player.hand):
-            if i not in indices_played_set:
-                new_hand.append(card)
-        
-        player.hand = new_hand
+        if invalid_indices: invalid_str = ', '.join(map(str, invalid_indices)); raise InvalidCardIndexError(f"无效编号: {invalid_str} (你只有编号 1 到 {hand_size} 的牌)。")
+
+        num_unique_cards_to_play = len(indices_0based)
+        if num_unique_cards_to_play > hand_size: logger.error(f"Logic Error? Play {num_unique_cards_to_play} > hand {hand_size}. P:{player_id}, I:{card_indices_1based}"); raise InvalidPlayQuantityError(f"逻辑错误：试图打出比手牌 ({hand_size}) 更多的牌 ({num_unique_cards_to_play})。")
+
+        logger.debug(f"P:{player_id} validated play idx {card_indices_1based} (0based: {indices_0based}) hand size {hand_size}.")
+        accepted_play_info = None
+        if self.state.last_play: accepted_cards = self.state.last_play.actual_cards; self.state.discard_pile.extend(accepted_cards); accepted_play_info = { "player_id": self.state.last_play.player_id, "player_name": self.state.last_play.player_name, "cards": accepted_cards }; logger.info(f"{player_data.name} accepts {self.state.last_play.player_name}'s cards."); self.state.last_play = None
+
+        cards_to_play = [player_data.hand[i] for i in indices_0based]
+        indices_played_set = set(indices_0based); new_hand = [card for i, card in enumerate(player_data.hand) if i not in indices_played_set]; player_data.hand = new_hand
         quantity_played = len(cards_to_play)
-        
-        self.last_play = {
-            "player_id": player_id,
-            "claimed_quantity": quantity_played,
-            "actual_cards": cards_to_play
-        }
-        
-        # 确定下一玩家
-        next_player_index = self.get_next_player_index()
-        if next_player_index == -1:
-            raise GameError("无法确定下一位玩家")
-        
-        self.current_player_index = next_player_index
-        next_player_id = self.turn_order[next_player_index]
-        
-        # 检查所有手牌是否为空
-        if self._check_all_hands_empty():
-            self._reshuffle_and_redeal("所有活跃玩家手牌已空")
-            return True
-        
-        self._trigger_event(GameEvent.CARDS_PLAYED, 
-                           player_id=player_id,
-                           cards_played=cards_to_play,
-                           quantity_played=quantity_played,
-                           next_player_id=next_player_id,
-                           player_hand_empty=(len(new_hand) == 0))
-        
-        return True
-    
-    def challenge(self, challenger_id: str) -> bool:
-        """
-        玩家质疑上一轮出牌
-        
-        Args:
-            challenger_id: 质疑者ID
-            
-        Returns:
-            bool: 是否成功质疑
-            
-        Raises:
-            GameError: 如果游戏状态不是进行中
-            InvalidPlayerError: 如果不是当前玩家的回合
-            InvalidActionError: 如果没有可质疑的出牌
-        """
-        if self.state != GameState.PLAYING:
-            raise GameError("游戏未在进行中")
-        
-        reacting_player_id = self.turn_order[self.current_player_index]
-        if challenger_id != reacting_player_id:
-            raise InvalidPlayerError("还没轮到你反应")
-        
-        if not self.last_play:
-            raise InvalidActionError("当前没有可质疑的出牌")
-        
-        player_who_played_id = self.last_play["player_id"]
-        actual_cards = self.last_play["actual_cards"]
-        claimed_quantity = self.last_play["claimed_quantity"]
-        
-        # 检查质疑是否成功
-        is_claim_true = self._check_challenge(actual_cards, self.main_card)
-        loser_id = challenger_id if is_claim_true else player_who_played_id
-        
-        # 将牌放入弃牌堆
-        self.discard_pile.extend(actual_cards)
-        self.last_play = None
-        
-        # 触发质疑事件
-        self._trigger_event(GameEvent.CHALLENGE_MADE, 
-                           challenger_id=challenger_id,
-                           challenged_id=player_who_played_id,
-                           actual_cards=actual_cards,
-                           is_claim_true=is_claim_true,
-                           loser_id=loser_id)
-        
-        # 输家开枪
-        shot_result = self.take_shot(loser_id)
-        
-        # 如果游戏结束，直接返回
-        if self.state == GameState.ENDED:
-            return True
-        
-        # 如果有人被淘汰，重新洗牌发牌
-        if shot_result["is_eliminated"]:
-            self._reshuffle_and_redeal(f"玩家 {self.players[loser_id].name} 被淘汰", eliminated_player_id=loser_id)
-            return True
-        
-        # 确定下一轮出牌者
-        challenger_still_active = not self.players[challenger_id].is_eliminated
-        if challenger_still_active:
-            self.current_player_index = self.turn_order.index(challenger_id)
-            next_player_id = challenger_id
-        else:
-            next_active_index = self.get_next_player_index()
-            if next_active_index != -1:
-                self.current_player_index = next_active_index
-                next_player_id = self.turn_order[next_active_index]
-            else:
-                raise GameError("质疑后无法确定下一位玩家")
-        
-        # 检查所有手牌是否为空
-        if self._check_all_hands_empty():
-            self._reshuffle_and_redeal("所有活跃玩家手牌已空")
-            return True
-        
-        # 触发下一轮事件
-        self._trigger_event(GameEvent.NEXT_TURN, 
-                           player_id=next_player_id,
-                           player_hand_empty=(not self.players[next_player_id].hand))
-        
-        return True
-    
-    def wait_turn(self, player_id: str) -> bool:
-        """
-        玩家选择等待（仅限手牌为空时）
-        
-        Args:
-            player_id: 玩家ID
-            
-        Returns:
-            bool: 是否成功等待
-            
-        Raises:
-            GameError: 如果游戏状态不是进行中
-            InvalidPlayerError: 如果不是当前玩家的回合
-            InvalidActionError: 如果玩家手牌不为空
-        """
-        if self.state != GameState.PLAYING:
-            raise GameError("游戏未在进行中")
-        
-        current_player_id = self.turn_order[self.current_player_index]
-        if player_id != current_player_id:
-            raise InvalidPlayerError("还没轮到你")
-        
-        player = self.players[player_id]
-        
-        # 检查手牌是否为空
-        if player.hand:
-            raise InvalidActionError("你还有手牌，不能选择等待")
-        
-        # 处理上一轮出牌
-        if self.last_play:
-            accepted_cards = self.last_play["actual_cards"]
-            self.discard_pile.extend(accepted_cards)
-            self.last_play = None
-        
-        # 确定下一玩家
-        next_player_index = self.get_next_player_index()
-        if next_player_index == -1:
-            raise GameError("无法确定下一位玩家")
-        
-        self.current_player_index = next_player_index
-        next_player_id = self.turn_order[next_player_index]
-        
-        # 检查所有手牌是否为空
-        if self._check_all_hands_empty():
-            self._reshuffle_and_redeal("所有活跃玩家手牌已空")
-            return True
-        
-        self._trigger_event(GameEvent.PLAYER_WAITED, 
-                           player_id=player_id,
-                           next_player_id=next_player_id,
-                           next_player_hand_empty=(not self.players[next_player_id].hand))
-        
-        return True
-    
-    def take_shot(self, player_id: str) -> Dict:
-        """
-        玩家开枪
-        
-        Args:
-            player_id: 玩家ID
-            
-        Returns:
-            Dict: 包含开枪结果的字典
-        """
-        player = self.players[player_id]
-        
-        if player.is_eliminated:
-            return {"success": False, "message": "玩家已被淘汰"}
-        
-        gun = player.gun
-        position = player.gun_position
-        bullet = gun[position]
-        player.gun_position = (position + 1) % len(gun)
-        
-        result = {
-            "success": True,
-            "player_id": player_id,
-            "bullet": bullet,
-            "is_eliminated": False
-        }
-        
-        if bullet == "实弹":
-            player.is_eliminated = True
-            result["is_eliminated"] = True
-            
-            self._trigger_event(GameEvent.PLAYER_SHOT, 
-                               player_id=player_id,
-                               is_eliminated=True)
-            
-            # 检查游戏是否结束
-            if self._check_game_end():
-                return result
-        else:
-            self._trigger_event(GameEvent.PLAYER_SHOT, 
-                               player_id=player_id,
-                               is_eliminated=False)
-        
-        return result
-    
-    def _check_challenge(self, actual_cards: List[str], main_card: str) -> bool:
-        """检查质疑是否成功（即出牌是否符合声明）"""
-        return all(card == main_card or card == self.config.JOKER for card in actual_cards)
-    
-    def _check_game_end(self) -> bool:
-        """检查游戏是否结束"""
-        active_players = self.get_active_players()
-        
-        if len(active_players) <= 1:
-            self.state = GameState.ENDED
-            winner_id = active_players[0] if active_players else None
-            
-            self._trigger_event(GameEvent.GAME_ENDED, 
-                               winner_id=winner_id,
-                               winner_name=self.players[winner_id].name if winner_id else "无人")
-            
-            return True
-        
-        return False
-    
-    def _check_all_hands_empty(self) -> bool:
-        """检查所有活跃玩家的手牌是否都为空"""
-        active_players = self.get_active_players()
-        
-        if not active_players:
-            return False
-        
-        return all(not self.players[pid].hand for pid in active_players)
-    
-    def _reshuffle_and_redeal(self, reason: str, eliminated_player_id: str = None) -> None:
-        """
-        重新洗牌并发牌
-        
-        Args:
-            reason: 重洗的原因
-            eliminated_player_id: 被淘汰的玩家ID（如果有）
-        """
-        active_player_ids = self.get_active_players()
-        
-        if not active_player_ids:
-            self.state = GameState.ENDED
-            self._trigger_event(GameEvent.GAME_ENDED, 
-                               winner_id=None,
-                               winner_name="无人")
-            return
-        
-        # 收集所有牌
-        new_deck = list(self.discard_pile)
-        self.discard_pile = []
-        
+        self.state.last_play = LastPlay(player_id, player_data.name, quantity_played, cards_to_play)
+        logger.info(f"{player_data.name} played {quantity_played} (Actual: {cards_to_play}). Hand size now: {len(new_hand)}")
+
+        reshuffle_result = self._check_and_handle_all_hands_empty_internal("玩家出牌后")
+        if reshuffle_result["reshuffled"]:
+             reshuffle_result.update({"accepted_play_info": accepted_play_info, "player_who_played_id": player_id, "player_who_played_name": player_data.name, "played_quantity": quantity_played, "played_cards": cards_to_play, "played_hand_empty": not new_hand, "action": "play"}); logger.info(f"{player_data.name} play triggered reshuffle."); return reshuffle_result
+
+        next_player_id, next_player_name = self._advance_turn()
+        if next_player_id is None:
+             logger.error("Play card: Could not advance turn, game ending."); self.state.status = GameStatus.ENDED
+             winner_id = self._get_winner_id(); winner_name = self.state.players[winner_id].name if winner_id else "无人"
+             return { "success": True, "action": "play", "player_id": player_id, "player_name": player_data.name, "quantity_played": quantity_played, "actual_cards": cards_to_play, "main_card": self.state.main_card, "hand_after_play": new_hand, "played_hand_empty": not new_hand, "accepted_play_info": accepted_play_info, "game_ended": True, "winner_id": winner_id, "winner_name": winner_name }
+
+        next_player_data = self.state.players.get(next_player_id); next_hand_empty_flag = (not next_player_data.hand) if next_player_data else True
+        return { "success": True, "action": "play", "player_id": player_id, "player_name": player_data.name, "quantity_played": quantity_played, "actual_cards": cards_to_play, "main_card": self.state.main_card, "hand_after_play": new_hand, "played_hand_empty": not new_hand, "next_player_id": next_player_id, "next_player_name": next_player_name, "next_player_hand_empty": next_hand_empty_flag, "accepted_play_info": accepted_play_info, "reshuffled": False, "game_ended": False }
+
+    def process_challenge(self, challenger_id: str) -> Dict[str, Any]:
+        """Processes a player's challenge action."""
+        self._check_is_playing(); self._check_player_turn(challenger_id)
+        if not self.state.last_play: raise NoChallengeTargetError("当前没有可以质疑的出牌。")
+
+        challenger_name = self.state.players[challenger_id].name; last_play = self.state.last_play
+        challenged_player_id = last_play.player_id; challenged_player_name = last_play.player_name
+        actual_cards = last_play.actual_cards; claimed_quantity = last_play.claimed_quantity
+        logger.info(f"{challenger_name} challenges {challenged_player_name}'s {claimed_quantity} cards (Actual: {actual_cards})")
+
+        is_claim_true = all(card == self.state.main_card or card == JOKER for card in actual_cards)
+        challenge_result = ChallengeResult.FAILURE if is_claim_true else ChallengeResult.SUCCESS
+        loser_id = challenger_id if challenge_result == ChallengeResult.FAILURE else challenged_player_id
+        loser_name = self.state.players[loser_id].name
+        logger.info(f"Challenge result: {challenge_result}. Loser: {loser_name}")
+
+        self.state.discard_pile.extend(actual_cards); self.state.last_play = None
+        shot_outcome = self._determine_shot_outcome(loser_id)
+        shot_applied_result = self._apply_shot_consequences(loser_id, shot_outcome)
+
+        result_base = { "success": True, "action": "challenge", "challenger_id": challenger_id, "challenger_name": challenger_name, "challenged_player_id": challenged_player_id, "challenged_player_name": challenged_player_name, "claimed_quantity": claimed_quantity, "actual_cards": actual_cards, "main_card": self.state.main_card, "challenge_result": challenge_result, "loser_id": loser_id, "loser_name": loser_name, "shot_outcome": shot_outcome }
+        result_base.update(shot_applied_result)
+
+        if not result_base.get("game_ended") and not result_base.get("reshuffled"):
+            next_player_id = None
+            challenger_still_active = challenger_id in self.state.players and not self.state.players[challenger_id].is_eliminated
+            if challenger_still_active:
+                next_player_id = challenger_id
+                try: self.state.current_player_index = self.state.turn_order.index(challenger_id)
+                except ValueError: logger.warning(f"Challenger {challenger_id} not in turn order?"); next_player_id, _ = self._advance_turn()
+            else: next_player_id, _ = self._advance_turn()
+
+            if next_player_id:
+                 next_player_data = self.state.players.get(next_player_id)
+                 result_base["next_player_id"] = next_player_id; result_base["next_player_name"] = next_player_data.name if next_player_data else "错误"; result_base["next_player_hand_empty"] = (not next_player_data.hand) if next_player_data else True
+            else: logger.error("Challenge: Could not advance turn, game ending."); self.state.status = GameStatus.ENDED; result_base["game_ended"] = True; winner_id = self._get_winner_id(); result_base["winner_id"] = winner_id; result_base["winner_name"] = self.state.players[winner_id].name if winner_id else "无人"
+
+            if not result_base.get("game_ended"):
+                reshuffle_check = self._check_and_handle_all_hands_empty_internal("质疑结算后");
+                if reshuffle_check["reshuffled"]: result_base.update(reshuffle_check); result_base["reshuffled"] = True
+        return result_base
+
+    def _apply_shot_consequences(self, player_id: str, shot_outcome: ShotResult) -> Dict[str, Any]:
+         """Applies state changes for shot outcome. Returns dict with game_ended/reshuffled flags."""
+         update_result = {"game_ended": False, "reshuffled": False}
+         player_data = self.state.players.get(player_id)
+         if not player_data: logger.error(f"Player {player_id} not found for shot."); return {"error": "Player not found."}
+
+         gun = player_data.gun; position = player_data.gun_position; gun_chambers = len(gun)
+         # Advance pointer AFTER shot outcome is determined based on CURRENT position
+         if gun and position is not None and gun_chambers > 0:
+              logger.debug(f"Advancing gun pointer for {player_data.name} from {position}...")
+              player_data.gun_position = (position + 1) % gun_chambers
+              logger.debug(f"  New gun pointer: {player_data.gun_position}")
+         else: logger.error(f"Cannot update gun position for {player_data.name}.")
+
+         if shot_outcome == ShotResult.HIT:
+             if not player_data.is_eliminated:
+                 player_data.is_eliminated = True; logger.info(f"{player_data.name} is eliminated.")
+                 if self._check_game_end_internal():
+                      update_result["game_ended"] = True; self.state.status = GameStatus.ENDED
+                      winner_id = self._get_winner_id(); update_result["winner_id"] = winner_id; update_result["winner_name"] = self.state.players[winner_id].name if winner_id else "无人"; logger.info("Game ended due to elimination.")
+                 else:
+                      logger.info("Elimination triggering reshuffle.")
+                      reshuffle_internal_result = self._reshuffle_internal(f"玩家 {player_data.name} 被淘汰", eliminated_player_id=player_id); update_result.update(reshuffle_internal_result); update_result["reshuffled"] = True
+         elif shot_outcome == ShotResult.SAFE: logger.info(f"{player_data.name} was safe.")
+         elif shot_outcome == ShotResult.ALREADY_ELIMINATED: logger.warning(f"Shot consequence on already eliminated {player_data.name}.")
+         elif shot_outcome == ShotResult.GUN_ERROR: logger.error(f"Gun error for {player_data.name}."); update_result["error"] = "枪支错误"
+         return update_result
+
+    def process_wait(self, player_id: str) -> Dict[str, Any]:
+        """Processes a player's 'wait' action (only if hand is empty)."""
+        self._check_is_playing(); self._check_player_turn(player_id)
+        player_data = self.state.players[player_id]
+        if player_data.hand: raise InvalidActionError("手牌不为空，不能选择等待。")
+
+        logger.info(f"{player_data.name} waits (empty hand).")
+        accepted_play_info = None
+        if self.state.last_play:
+            accepted_cards = self.state.last_play.actual_cards; self.state.discard_pile.extend(accepted_cards); accepted_play_info = { "player_id": self.state.last_play.player_id, "player_name": self.state.last_play.player_name, "cards": accepted_cards }; logger.info(f"{player_data.name} accepts {self.state.last_play.player_name}'s cards by waiting."); self.state.last_play = None
+
+        reshuffle_result = self._check_and_handle_all_hands_empty_internal("玩家等待后")
+        if reshuffle_result["reshuffled"]: reshuffle_result.update({"accepted_play_info": accepted_play_info, "player_who_waited_id": player_id, "player_who_waited_name": player_data.name, "action": "wait"}); return reshuffle_result
+
+        next_player_id, next_player_name = self._advance_turn()
+        if next_player_id is None: logger.error("Wait: Could not advance turn, game ending."); self.state.status = GameStatus.ENDED; winner_id = self._get_winner_id(); winner_name = self.state.players[winner_id].name if winner_id else "无人"; return {"success": True, "action": "wait", "player_id": player_id, "player_name": player_data.name, "accepted_play_info": accepted_play_info, "game_ended": True, "winner_id": winner_id, "winner_name": winner_name}
+
+        next_player_data = self.state.players.get(next_player_id); next_hand_empty_flag = (not next_player_data.hand) if next_player_data else True
+        return { "success": True, "action": "wait", "player_id": player_id, "player_name": player_data.name, "next_player_id": next_player_id, "next_player_name": next_player_name, "next_player_hand_empty": next_hand_empty_flag, "accepted_play_info": accepted_play_info, "reshuffled": False, "game_ended": False }
+
+    # --- Internal Helper Methods ---
+    def _check_is_playing(self):
+        if self.state.status != GameStatus.PLAYING: raise GameNotPlayingError(f"游戏需要为 PLAYING 状态 (当前: {self.state.status.name})。")
+    def _check_player_turn(self, player_id: str):
+        current_player_id = self.get_current_player_id();
+        if current_player_id != player_id: current_name = self.get_current_player_name() or "未知"; raise NotPlayersTurnError(f"还没轮到你，当前轮到 {current_name}。", current_player_name=current_name)
+        player_data = self.state.players.get(player_id);
+        if not player_data: raise PlayerNotInGameError(f"玩家 {player_id} 不在本局。")
+        if player_data.is_eliminated: raise InvalidActionError(f"你 ({player_data.name}) 已被淘汰。")
+    def get_current_player_id(self) -> Optional[str]:
+        if self.state.status != GameStatus.PLAYING or not self.state.turn_order or not (0 <= self.state.current_player_index < len(self.state.turn_order)): return None
+        try: return self.state.turn_order[self.state.current_player_index]
+        except IndexError: logger.error(f"IndexError get current player at {self.state.current_player_index}"); return None
+    def get_current_player_name(self) -> Optional[str]:
+        player_id = self.get_current_player_id(); player_data = self.state.players.get(player_id) if player_id else None; return player_data.name if player_data else None
+    def get_player_hand(self, player_id: str) -> Optional[List[str]]:
+         player = self.state.players.get(player_id); return list(player.hand) if player else None
+    def get_player_status_info(self) -> List[Dict[str, Any]]:
+         status_list = [];
+         for pid in self.state.turn_order:
+              pdata = self.state.players.get(pid);
+              if pdata: status_list.append({"id": pid, "name": pdata.name, "is_eliminated": pdata.is_eliminated, "hand_count": len(pdata.hand) if not pdata.is_eliminated else 0})
+              else: logger.warning(f"Player {pid} in order but not dict."); status_list.append({"id": pid, "name": f"[未知:{pid}]", "is_eliminated": True, "hand_count": 0})
+         return status_list
+    def _build_deck(self, player_count: int) -> List[str]:
+        """Builds a deck with sufficient cards dynamically based on player count."""
+        if player_count <= 0: return []
+        hand_size = HAND_SIZE; num_base_types = len(CARD_TYPES_BASE); min_base_cards_per_type = max(5, MAX_PLAY_CARDS * 2)
+        total_cards_needed = player_count * hand_size; joker_count = math.ceil(player_count / 2)
+        total_base_cards_needed = total_cards_needed - joker_count
+        base_per_type_calc = math.ceil(max(0, total_base_cards_needed) / num_base_types)
+        base_per_type = max(base_per_type_calc, min_base_cards_per_type)
+        deck = [];
+        for card_type in CARD_TYPES_BASE: deck.extend([card_type] * base_per_type)
+        deck.extend([JOKER] * joker_count)
+        logger.info(f"动态构建牌堆 ({player_count}名玩家): {num_base_types}种基础牌各 {base_per_type} 张, {joker_count} 张 Joker. 总牌数: {len(deck)} (需求: {total_cards_needed}).")
+        return deck
+
+    # --- MODIFIED _deal_cards_new_rule with detailed logging ---
+    def _deal_cards_new_rule(self):
+        """Deals cards from self.state.deck to active players based on main card rule."""
+        main_card = self.state.main_card; active_player_ids = self._get_active_player_ids();
+        if not main_card: raise GameError("Deal fail: Main card not set.");
+        if not active_player_ids: logger.warning("Deal: No active players."); return
+
+        deck = list(self.state.deck); random.shuffle(deck)
+        required_main_or_joker = len(active_player_ids) * 2; available_main = deck.count(main_card); available_joker = deck.count(JOKER)
+        if available_main + available_joker < required_main_or_joker: raise ValueError(f"牌堆主牌({main_card})/Joker不足 ({available_main}+{available_joker}), 无法满足每人至少需要 {required_main_or_joker // len(active_player_ids)} 张的需求")
+        if len(deck) < len(active_player_ids) * HAND_SIZE: logger.warning(f"Deck size ({len(deck)}) insufficient for {len(active_player_ids)}*{HAND_SIZE} cards.")
+
+        deck_after_min_deal = list(deck); temp_hands = {pid: [] for pid in active_player_ids}; main_cards_dealt_total = 0; jokers_used_for_main_total = 0
+        logger.debug(f"开始发保底牌 (主牌 {main_card})...")
         for p_id in active_player_ids:
-            player_hand = self.players[p_id].hand
-            if player_hand:
-                new_deck.extend(player_hand)
-                self.players[p_id].hand = []
-        
-        # 确定新主牌
-        self.main_card = self._determine_main_card()
-        
-        # 洗牌
-        random.shuffle(new_deck)
-        
-        # 重新发牌
+            dealt_main = 0; dealt_joker = 0; needed = 2
+            logger.debug(f"  为 {p_id} 发保底牌:")
+            # 1. 发主牌
+            indices_to_remove_main = [i for i, card in enumerate(deck_after_min_deal) if card == main_card]
+            logger.debug(f"    找到 {len(indices_to_remove_main)} 个主牌索引: {indices_to_remove_main}")
+            for index in sorted(indices_to_remove_main, reverse=True):
+                if dealt_main < needed:
+                    try: card_popped = deck_after_min_deal.pop(index); temp_hands[p_id].append(card_popped); dealt_main += 1; main_cards_dealt_total += 1; # logger.debug(f"      -> 发了主牌 {card_popped} (来自索引 {index})") # Verbose
+                    except IndexError: logger.error(f"IndexError popping main card at {index} for {p_id}"); break
+                else: break
+            logger.debug(f"    发完主牌后，需要 {needed - dealt_main} 张 Joker。")
+            # 2. 补 Joker (Fixed Logic)
+            needed -= dealt_main
+            if needed > 0:
+                all_joker_indices = [i for i, card in enumerate(deck_after_min_deal) if card == JOKER]
+                logger.debug(f"    找到 {len(all_joker_indices)} 个 Joker 索引: {all_joker_indices}")
+                jokers_popped_count = 0
+                for index in sorted(all_joker_indices, reverse=True):
+                    if dealt_joker < needed: # Check *inside* the loop
+                        try: card_popped = deck_after_min_deal.pop(index); temp_hands[p_id].append(card_popped); dealt_joker += 1; jokers_used_for_main_total += 1; jokers_popped_count += 1; # logger.debug(f"      -> 发了 Joker {card_popped} (来自索引 {index})") # Verbose
+                        except IndexError: logger.error(f"IndexError popping joker at {index} for {p_id}"); break
+                    else: break # Stop when enough jokers are dealt for this player
+                logger.debug(f"    实际补发 {jokers_popped_count} 张 Joker。")
+            logger.debug(f"    保底牌完成: {dealt_main} 主牌, {dealt_joker} Joker。当前手牌: {temp_hands[p_id]}")
+            if dealt_main + dealt_joker < 2: logger.error(f"Logic error: Failed dealing min 2 main/joker to {p_id}! Got {dealt_main}+{dealt_joker}."); raise GameError(f"内部错误：无法为玩家 {self.state.players[p_id].name} 发放足够的保底牌。")
+
+        logger.info(f"保底牌发放统计: {main_cards_dealt_total} 张 {main_card}, {jokers_used_for_main_total} 张 Jokers。剩余牌: {len(deck_after_min_deal)}")
+        # 3. 补齐剩余牌
+        deck_remaining = deck_after_min_deal
+        logger.debug("开始补齐剩余手牌...")
         for p_id in active_player_ids:
-            hand = []
-            for _ in range(self.config.HAND_SIZE):
-                if new_deck:
-                    hand.append(new_deck.pop())
-                else:
-                    break
-            self.players[p_id].hand = hand
-            
-            self._trigger_event(GameEvent.CARDS_DEALT, 
-                               player_id=p_id,
-                               hand=hand,
-                               main_card=self.main_card)
-        
-        # 确定新一轮的起始玩家
-        start_player_id = None
-        start_player_index = -1
-        turn_order = self.turn_order
-        num_players = len(turn_order)
-        
-        if eliminated_player_id:
-            # 如果有人被淘汰，从被淘汰者的下一位开始找活跃玩家
-            try:
-                eliminated_idx = turn_order.index(eliminated_player_id)
-                current_check_idx = (eliminated_idx + 1) % num_players
-                
-                for _ in range(num_players):
-                    potential_starter_id = turn_order[current_check_idx]
-                    if not self.players[potential_starter_id].is_eliminated:
-                        start_player_id = potential_starter_id
-                        start_player_index = current_check_idx
-                        break
-                    current_check_idx = (current_check_idx + 1) % num_players
-            except ValueError:
-                # Fallback: 随机选一个活跃玩家
-                if active_player_ids:
-                    start_player_id = random.choice(active_player_ids)
-                    try:
-                        start_player_index = turn_order.index(start_player_id)
-                    except ValueError:
-                        # 严重错误，可能需要结束游戏
-                        self.state = GameState.ENDED
-                        self._trigger_event(GameEvent.GAME_ENDED, 
-                                           winner_id=None,
-                                           winner_name="无人")
-                        return
-        else:
-            # 从上一轮的当前玩家开始找活跃玩家
-            current_check_idx = self.current_player_index
-            
-            for _ in range(num_players):
-                potential_starter_id = turn_order[current_check_idx]
-                if not self.players[potential_starter_id].is_eliminated:
-                    start_player_id = potential_starter_id
-                    start_player_index = current_check_idx
-                    break
-                current_check_idx = (current_check_idx + 1) % num_players
-        
-        # 检查是否找到起始玩家
-        if start_player_id is None:
-            self.state = GameState.ENDED
-            self._trigger_event(GameEvent.GAME_ENDED, 
-                               winner_id=None,
-                               winner_name="无人")
-            return
-        
-        self.current_player_index = start_player_index
-        self.last_play = None
-        
-        # 触发重洗事件
-        self._trigger_event(GameEvent.RESHUFFLED, 
-                           reason=reason,
-                           main_card=self.main_card,
-                           start_player_id=start_player_id)
-    
-    def force_end(self) -> bool:
-        """强制结束游戏"""
-        if self.state == GameState.ENDED:
-            return False
-        
-        self.state = GameState.ENDED
-        self._trigger_event(GameEvent.GAME_ENDED, 
-                           winner_id=None,
-                           winner_name="无人",
-                           forced=True)
-        
-        return True
-    
-    def get_game_status(self) -> Dict:
-        """获取游戏状态信息"""
-        status = {
-            "game_id": self.game_id,
-            "state": self.state.value,
-            "player_count": len(self.players),
-            "active_player_count": len(self.get_active_players()),
-            "discard_pile_count": len(self.discard_pile),
-            "deck_count": len(self.deck)
-        }
-        
-        if self.state != GameState.WAITING:
-            status.update({
-                "main_card": self.main_card,
-                "turn_order": [self.players[pid].name for pid in self.turn_order],
-                "current_player_index": self.current_player_index
-            })
-            
-            if 0 <= self.current_player_index < len(self.turn_order):
-                current_player_id = self.turn_order[self.current_player_index]
-                status["current_player"] = {
-                    "id": current_player_id,
-                    "name": self.players[current_player_id].name
-                }
-            
-            if self.last_play:
-                status["last_play"] = {
-                    "player_id": self.last_play["player_id"],
-                    "player_name": self.players[self.last_play["player_id"]].name,
-                    "claimed_quantity": self.last_play["claimed_quantity"]
-                }
-        
-        status["players"] = {}
-        for pid, player in self.players.items():
-            status["players"][pid] = {
-                "name": player.name,
-                "is_eliminated": player.is_eliminated,
-                "hand_size": len(player.hand)
-            }
-        
-        return status
+            current_hand_size = len(temp_hands[p_id]); fill_needed = HAND_SIZE - current_hand_size
+            # --- ADDED LOGGING ---
+            logger.debug(f"  为 {p_id} (当前 {current_hand_size} 张) 补齐 {fill_needed} 张。")
+            logger.debug(f"    牌堆补牌前状态 (剩余 {len(deck_remaining)} 张): {deck_remaining[:10]}...") # 显示前10张牌
+            # --- END LOGGING ---
+            if fill_needed > 0:
+                 if len(deck_remaining) < fill_needed: logger.warning(f"牌堆不足以为 {p_id} 补齐剩余 {fill_needed} 张牌 (只有 {len(deck_remaining)} 张)。"); fill_needed = len(deck_remaining)
+                 cards_added_this_round = 0
+                 for i in range(fill_needed):
+                      if not deck_remaining: logger.warning(f"补牌给 {p_id} 时牌堆提前耗尽 (已补 {i} 张)。"); break
+                      card_to_add = deck_remaining.pop(0); temp_hands[p_id].append(card_to_add); cards_added_this_round += 1
+                      # logger.debug(f"      -> 添加 {card_to_add} (手牌增至 {len(temp_hands[p_id])})") # Optional verbose log
+                 logger.debug(f"    实际为 {p_id} 补发 {cards_added_this_round} 张。")
+
+            random.shuffle(temp_hands[p_id]); self.state.players[p_id].hand = temp_hands[p_id]
+            # --- Changed Log Level ---
+            logger.info(f"玩家 {self.state.players[p_id].name} ({p_id}) 的最终手牌数量: {len(self.state.players[p_id].hand)}")
+
+        self.state.deck = []; logger.info("发牌流程完成。")
+    # --- End of MODIFIED _deal_cards_new_rule ---
+
+    def _get_active_player_ids(self) -> List[str]: return [pid for pid, pdata in self.state.players.items() if not pdata.is_eliminated]
+    def _get_ordered_active_player_ids(self) -> List[str]: active = self._get_active_player_ids(); return [pid for pid in self.state.turn_order if pid in active]
+    def _advance_turn(self) -> Tuple[Optional[str], Optional[str]]:
+        if not self.state.turn_order or self.state.status != GameStatus.PLAYING: logger.error("Cannot advance turn."); return None, None
+        num_players = len(self.state.turn_order); current_idx = self.state.current_player_index
+        for i in range(num_players):
+            next_idx = (current_idx + 1 + i) % num_players
+            next_player_id = self.state.turn_order[next_idx]; player_data = self.state.players.get(next_player_id)
+            if player_data and not player_data.is_eliminated: self.state.current_player_index = next_idx; logger.info(f"Turn advanced to {player_data.name}({next_player_id})"); return next_player_id, player_data.name
+        logger.error("Could not find next active player!"); return None, None
+
+    # --- MODIFIED _determine_shot_outcome with logging ---
+    def _determine_shot_outcome(self, player_id: str) -> ShotResult:
+         player_data = self.state.players.get(player_id);
+         if not player_data: return ShotResult.GUN_ERROR;
+         if player_data.is_eliminated: return ShotResult.ALREADY_ELIMINATED;
+         gun = player_data.gun; position = player_data.gun_position; gun_chambers = len(gun);
+         if not gun or position is None or not (0 <= position < gun_chambers): logger.error(f"Invalid gun info for {player_data.name}"); return ShotResult.GUN_ERROR;
+
+         # --- ADDED LOGGING ---
+         logger.debug(f"开枪判定 for {player_data.name} ({player_id}):")
+         logger.debug(f"  Gun State: {gun}")
+         logger.debug(f"  Current Position: {position}")
+         # --- END LOGGING ---
+
+         bullet = gun[position]; # Check the bullet at the current position
+         logger.info(f"  玩家 {player_data.name} 在位置 {position} 开枪，子弹是: '{bullet}'") # Use INFO level
+         return ShotResult.HIT if bullet == "实弹" else ShotResult.SAFE
+    # --- End of MODIFIED _determine_shot_outcome ---
+
+    def _check_game_end_internal(self) -> bool: return len(self._get_active_player_ids()) <= 1
+    def _get_winner_id(self) -> Optional[str]: active = self._get_active_player_ids(); return active[0] if len(active) == 1 else None
+    def _check_and_handle_all_hands_empty_internal(self, trigger_reason: str) -> Dict[str, Any]:
+         active_players = self._get_ordered_active_player_ids();
+         if not active_players: logger.debug("No active players, skip empty check."); return {"reshuffled": False}
+         all_empty = all(not self.state.players[pid].hand for pid in active_players);
+         if all_empty: logger.info(f"All hands empty ({trigger_reason}). Triggering reshuffle."); return self._reshuffle_internal(f"所有活跃玩家手牌已空 ({trigger_reason})")
+         else: return {"reshuffled": False}
+    def _reshuffle_internal(self, reason: str, eliminated_player_id: Optional[str] = None) -> Dict[str, Any]:
+         logger.info(f"开始内部洗牌。原因: {reason}"); self.state.round_start_reason = reason
+         active_player_ids = self._get_ordered_active_player_ids(); player_count = len(active_player_ids)
+         if not active_player_ids: logger.error("Reshuffle: No active players!"); self.state.status = GameStatus.ENDED; return {"reshuffled": True, "game_ended": True, "error": "洗牌时无活跃玩家。"}
+         self.state.discard_pile = [];
+         for p_id in active_player_ids:
+             if p_id in self.state.players: self.state.players[p_id].hand = []
+         logger.info("Cleared discard pile and active hands.")
+         self.state.main_card = random.choice(CARD_TYPES_BASE); logger.info(f"Reshuffle new main card: {self.state.main_card}")
+         self.state.deck = self._build_deck(player_count); logger.info(f"Rebuilt dynamic deck ({len(self.state.deck)} cards) for {player_count} active players.")
+         try: self._deal_cards_new_rule()
+         except (ValueError, IndexError) as e: logger.error(f"Reshuffle dealing failed: {e}", exc_info=True); self.state.status = GameStatus.ENDED; return { "reshuffled": True, "game_ended": True, "error": f"洗牌后重新发牌失败: {e}", "new_main_card": self.state.main_card, }
+         start_player_id = self._determine_next_starter_after_reshuffle(eliminated_player_id)
+         if not start_player_id: logger.error("Reshuffle cannot determine starter!"); self.state.status = GameStatus.ENDED; return { "reshuffled": True, "game_ended": True, "error": "无法确定起始玩家。", "new_main_card": self.state.main_card }
+         try: self.state.current_player_index = self.state.turn_order.index(start_player_id)
+         except ValueError: logger.error(f"Starter {start_player_id} not in turn order!"); self.state.status = GameStatus.ENDED; return { "reshuffled": True, "game_ended": True, "error": "无法设置回合索引。" }
+         self.state.last_play = None; logger.info(f"Reshuffle complete. Next turn: {self.state.players[start_player_id].name}")
+         return { "reshuffled": True, "game_ended": False, "reason": reason, "new_main_card": self.state.main_card, "new_hands": {pid: self.state.players[pid].hand for pid in active_player_ids}, "next_player_id": start_player_id, "next_player_name": self.state.players[start_player_id].name, "turn_order_names": [pdata.name + (" (淘汰)" if pdata.is_eliminated else "") for pid, pdata in sorted(self.state.players.items(), key=lambda item: self.state.turn_order.index(item[0]) if item[0] in self.state.turn_order else float('inf'))], }
+    def _determine_next_starter_after_reshuffle(self, eliminated_player_id: Optional[str]) -> Optional[str]:
+         active_ids_ordered = self._get_ordered_active_player_ids();
+         if not active_ids_ordered: logger.warning("No active players for next starter."); return None
+         start_checking_id = None
+         if eliminated_player_id and eliminated_player_id in self.state.turn_order:
+              try: elim_idx = self.state.turn_order.index(eliminated_player_id); start_checking_id = self.state.turn_order[(elim_idx + 1) % len(self.state.turn_order)]
+              except ValueError: pass
+         if not start_checking_id and 0 <= self.state.current_player_index < len(self.state.turn_order): start_checking_id = self.state.turn_order[(self.state.current_player_index + 1) % len(self.state.turn_order)]
+         if not start_checking_id and self.state.turn_order: start_checking_id = self.state.turn_order[0]
+         if not start_checking_id: return active_ids_ordered[0]
+         try: start_idx = self.state.turn_order.index(start_checking_id)
+         except ValueError: start_idx = 0
+         for i in range(len(self.state.turn_order)):
+              check_id = self.state.turn_order[(start_idx + i) % len(self.state.turn_order)];
+              if check_id in active_ids_ordered: return check_id
+         return active_ids_ordered[0]

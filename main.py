@@ -1,688 +1,278 @@
-# main.py - 骗子酒馆插件入口 (瘦身版)
-# 处理 AstrBot 事件，调用游戏逻辑
+# 请将这段代码完整粘贴到 main.py 文件中 (已修复 Pylance 报错的两行)
 
-from typing import Dict, Any, List, Optional
+# -*- coding: utf-8 -*-
+
+import logging
 import re
+from typing import List, Dict, Optional, Any
 
-# --- 从 astrbot.api 导入所需组件 ---
-from astrbot.api import logger
-import astrbot.api.message_components as Comp
-from astrbot.api.event import AstrMessageEvent, filter
+# --- AstrBot API Imports ---
+from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.star import Context, Star, register
+import astrbot.api.message_components as Comp
 
-# --- 导入游戏逻辑和模型（使用相对导入）---
-from .game_logic import LiarsTavernGame
-from .models import GameEvent, GameConfig, GameState
-from .message_utils import MessageFormatter
-from .exceptions import GameError, InvalidActionError, InvalidPlayerError
+# --- Local Imports ---
+from .exceptions import GameError, NotPlayersTurnError, InvalidActionError
+from .game_logic import LiarDiceGame
+from .models import GameStatus, MIN_PLAYERS, GameState, MAX_PLAY_CARDS
+from .exceptions import GameError, NotEnoughPlayersError
+from .message_utils import (
+    format_hand, build_join_message, build_start_game_message,
+    build_play_card_announcement, build_challenge_result_messages,
+    build_wait_announcement, build_reshuffle_announcement,
+    build_game_status_message, build_game_end_message,
+    build_error_message
+)
 
-# --- 插件注册 ---
-@register("liar_tavern", "骗子酒馆助手", "左轮扑克 (骗子酒馆规则变体)", "3.0.0", "https://github.com/xunxiing/astrbot_plugin_liars_bar")
-class LiarsPokerPlugin(Star):
+# --- Logger Setup ---
+logger = logging.getLogger(__name__)
+
+# --- Plugin Registration ---
+@register(
+    "骗子酒馆", "YourName", "一个结合了吹牛和左轮扑克的多人卡牌游戏 (重构版)。",
+    "1.1.2", # <-- 版本号再微调
+    "your_repo_url"
+)
+class LiarDicePlugin(Star):
     def __init__(self, context: Context):
         super().__init__(context)
-        self.games: Dict[str, LiarsTavernGame] = {}
-        self.message_formatter = MessageFormatter()
-        logger.info("LiarsPokerPlugin (左轮扑克) 初始化完成。")
+        self.context = context
+        self.games: Dict[str, LiarDiceGame] = {}
+        logger.info("骗子酒馆插件 (重构版) 已加载并初始化")
 
-    # --- 辅助函数 ---
-    def _get_group_id(self, event: AstrMessageEvent) -> str | None:
-        if hasattr(event, 'message_obj') and hasattr(event.message_obj, 'group_id'):
-            return str(event.message_obj.group_id)
-        return None
+    # --- AstrBot Interaction Helpers ---
+    def _get_group_id(self, event: AstrMessageEvent) -> Optional[str]:
+        group_id = event.get_group_id(); return str(group_id) if group_id else None
+    def _get_user_id(self, event: AstrMessageEvent) -> Optional[str]:
+        sender_id = event.get_sender_id(); return str(sender_id) if sender_id else None
+    async def _get_bot_instance(self, event: AstrMessageEvent) -> Optional[Any]:
+        if hasattr(event, 'bot') and (hasattr(event.bot, 'send_private_msg') or hasattr(event.bot, 'send_group_msg')): return event.bot
+        logger.warning("Could not reliably get bot instance from event."); return None
+    async def _send_private_message_text(self, event: AstrMessageEvent, user_id: str, text: str) -> bool:
+        bot = await self._get_bot_instance(event)
+        if not bot or not hasattr(bot, 'send_private_msg'): logger.error(f"Cannot send PM to {user_id}: No valid bot instance."); return False
+        try: await bot.send_private_msg(user_id=int(user_id), message=text); logger.debug(f"Direct PM to {user_id} sent."); return True
+        except ValueError: logger.error(f"Invalid user_id '{user_id}' for PM."); return False
+        except Exception as e: logger.error(f"Direct PM to {user_id} failed: {e}", exc_info=False); return False
+    async def _send_hand_update(self, event: AstrMessageEvent, group_id: str, player_id: str, hand: List[str], main_card: Optional[str]) -> bool:
+        if main_card is None: main_card = "未定"
+        if not hand: pm_text = f"游戏骗子酒馆 (群: {group_id})\n✋ 手牌: 无\n👑 主牌: 【{main_card}】\n👉 你已无手牌，轮到你时只能 /质疑 或 /等待"
+        else: hand_display = format_hand(hand); pm_text = f"游戏骗子酒馆 (群: {group_id})\n✋ 手牌: {hand_display}\n👑 主牌: 【{main_card}】\n👉 (出牌请用括号内编号)"
+        success = await self._send_private_message_text(event, player_id, pm_text)
+        if not success: logger.warning(f"向玩家 {player_id} 发送手牌更新私信失败 (群 {group_id})")
+        return success
+    async def _handle_game_result(self, event: AstrMessageEvent, group_id: str, result: Dict[str, Any]) -> List[List[Any]]:
+        messages_to_yield = []; pm_failures = []
+        if not result or not result.get("success"): error_msg = result.get("error", "未知游戏逻辑错误") if result else "未知游戏逻辑错误"; logger.warning(f"[群{group_id}] Game logic error: {error_msg}"); messages_to_yield.append([Comp.Plain(f"❗ 操作失败: {error_msg}")]); return messages_to_yield
+        action = result.get("action"); current_main_card = result.get("new_main_card") or (self.games.get(group_id, None) and self.games[group_id].state.main_card) or "未知"
+        hands_to_update = result.get("new_hands", {})
+        if action == "play" and not hands_to_update and "hand_after_play" in result: hands_to_update[result["player_id"]] = result["hand_after_play"]
+        if group_id in self.games:
+            for p_id, hand in hands_to_update.items():
+                if not await self._send_hand_update(event, group_id, p_id, hand, current_main_card):
+                    player_data_for_name = self.games[group_id].state.players.get(p_id); failed_player_name = player_data_for_name.name if player_data_for_name else p_id; pm_failures.append(failed_player_name)
+        else: logger.warning(f"[群{group_id}] Game ended before PMs could be sent.")
+        primary_messages = []
+        if action == "play": primary_messages.append(build_play_card_announcement(result))
+        elif action == "challenge": primary_messages.extend(build_challenge_result_messages(result))
+        elif action == "wait": primary_messages.append(build_wait_announcement(result))
+        messages_to_yield.extend(primary_messages)
+        game_ended_flag = result.get("game_ended", False); reshuffled_flag = result.get("reshuffled", False)
+        if reshuffled_flag and not game_ended_flag: messages_to_yield.append(build_reshuffle_announcement(result))
+        if game_ended_flag: winner_id = result.get("winner_id"); winner_name = result.get("winner_name"); messages_to_yield.append(build_game_end_message(winner_id, winner_name)); del self.games[group_id]; logger.info(f"[群{group_id}] Game ended.")
+        if pm_failures: messages_to_yield.append([Comp.Plain(f"⚠️ 注意：未能成功向 {', '.join(pm_failures)} 发送手牌私信。")])
+        return messages_to_yield
 
-    def _get_user_id(self, event: AstrMessageEvent) -> str | None:
-        if hasattr(event, 'message_obj') and hasattr(event.message_obj, 'sender') and hasattr(event.message_obj.sender, 'user_id'):
-            return str(event.message_obj.sender.user_id)
-        return None
+    # --- Command Handlers ---
 
-    async def _get_bot_instance(self, event: AstrMessageEvent) -> Any:
-        if hasattr(event, 'bot') and hasattr(event.bot, 'send_private_msg') and hasattr(event.bot, 'send_group_msg'):
-            return event.bot
-        logger.error("未能通过 event.bot 获取有效的 bot 实例")
-        raise AttributeError("未能通过 event.bot 获取有效的 bot 实例")
-
-    async def _reply_text(self, event: AstrMessageEvent, text: str):
-        """直接回复纯文本消息"""
-        await self._reply_with_components(event, [Comp.Plain(text=text)])
-
-    async def _reply_with_components(self, event: AstrMessageEvent, components: List[Any]):
-        """使用指定的组件列表回复消息"""
-        group_id = self._get_group_id(event)
-        if group_id:
-            try:
-                await self._send_group_message_comp(event, group_id, components)
-            except Exception as e:
-                logger.error(f"回复群消息 (带组件) 时出错: {e}")
-        else:
-            user_id = self._get_user_id(event)
-            if user_id:
-                try:
-                    plain_text = "".join(c.text for c in components if isinstance(c, Comp.Plain))
-                    if plain_text: 
-                        await self._send_private_message_text(event, user_id, plain_text)
-                    else: 
-                        logger.warning("无法将组件转换为纯文本以进行私聊回复")
-                except Exception as e: 
-                    logger.error(f"尝试回复私聊 (带组件) 失败: {e}")
-            else: 
-                logger.error("无法获取群组ID或用户ID进行回复")
-
-    async def _send_group_message_comp(self, event: AstrMessageEvent, group_id: str, astr_message_list: list):
-        try:
-            bot = await self._get_bot_instance(event)
-            onebot_message = self._convert_astr_comps_to_onebot(astr_message_list)
-            if not onebot_message: 
-                logger.warning(f"转换后的 OneBot 消息为空，取消向群 {group_id} 发送")
-                return
-            logger.info(f"准备发送给 OneBot 的消息段 (群 {group_id}): {onebot_message}")
-            await bot.send_group_msg(group_id=int(group_id), message=onebot_message)
-            logger.info(f"尝试通过 bot.send_group_msg 向群 {group_id} 发送消息完成")
-        except ValueError: 
-            logger.error(f"无法将 group_id '{group_id}' 转换为整数")
-            raise
-        except AttributeError as e: 
-            logger.error(f"发送群消息失败: {e}")
-            raise
-        except Exception as e: 
-            logger.error(f"通过 bot.send_group_msg 发送群聊给 {group_id} 失败: {e}", exc_info=True)
-            raise
-
-    def _convert_astr_comps_to_onebot(self, astr_message_list: List[Any]) -> List[Dict]:
-        onebot_segments = []
-        for comp in astr_message_list:
-            if isinstance(comp, Comp.Plain):
-                onebot_segments.append({"type": "text", "data": {"text": comp.text}})
-            elif isinstance(comp, Comp.At):
-                onebot_segments.append({"type": "at", "data": {"qq": str(comp.qq)}})
-            else:
-                logger.warning(f"未处理的 AstrBot 消息组件类型: {type(comp)}, 将尝试转为文本")
-                try: 
-                    text_repr = str(comp)
-                    onebot_segments.append({"type": "text", "data": {"text": text_repr}})
-                except Exception: 
-                    logger.error(f"无法将组件 {type(comp)} 转换为文本", exc_info=True)
-        return onebot_segments
-
-    async def _send_private_message_text(self, event: AstrMessageEvent, user_id: str, text: str):
-        try:
-            bot = await self._get_bot_instance(event)
-            logger.info(f"准备通过 bot 实例向 {user_id} 发送私聊文本: {text}")
-            await bot.send_private_msg(user_id=int(user_id), message=text)
-            logger.info(f"尝试通过 bot.send_private_msg 向 {user_id} 发送私聊完成")
-        except ValueError: 
-            logger.error(f"无法将 user_id '{user_id}' 转换为整数用于发送私聊")
-            raise
-        except AttributeError as e: 
-            logger.error(f"发送私聊消息失败: {e}")
-            raise
-        except Exception as e: 
-            logger.error(f"通过 bot.send_private_msg 发送私聊给 {user_id} 失败: {e}", exc_info=True)
-            raise
-
-    async def _send_hand_update(self, event: AstrMessageEvent, group_id: str, player_id: str, hand: List[str], main_card: str):
-        """向玩家发送手牌更新的私信"""
-        message = self.message_formatter.format_hand_update(group_id, hand, main_card)
-        
-        try:
-            await self._send_private_message_text(event, player_id, message)
-            logger.info(f"已向玩家 {player_id} 发送手牌更新私信")
-            return True
-        except Exception as e:
-            logger.warning(f"向玩家 {player_id} 发送手牌更新私信失败: {e}")
-            return False
-
-    # --- 游戏事件回调处理 ---
-    def _register_game_callbacks(self, game: LiarsTavernGame, event: AstrMessageEvent):
-        """为游戏注册事件回调"""
-        
-        async def on_player_joined(game_instance, **kwargs):
-            player = kwargs.get('player')
-            await self._reply_text(event, f"✅ {player.name} 已加入！当前 {len(game_instance.players)} 人。")
-        
-        async def on_game_started(game_instance, **kwargs):
-            main_card = kwargs.get('main_card')
-            turn_order = kwargs.get('turn_order')
-            first_player_id = kwargs.get('first_player_id')
-            
-            # 发送手牌给所有玩家
-            pm_failed_players = []
-            for player_id, player in game_instance.players.items():
-                if not await self._send_hand_update(event, game_instance.game_id, player_id, player.hand, main_card):
-                    pm_failed_players.append(player.name)
-            
-            # 构建游戏开始消息
-            start_message_components = [
-                Comp.Plain(text=f"游戏开始！共有 {len(game_instance.players)} 名玩家。\n"
-                          f"👑 主牌: {main_card}\n"
-                          f"已将手牌发送给各位。\n"
-                          f"📜 顺序: {', '.join([game_instance.players[pid].name for pid in turn_order])}\n"
-                          f"👉 轮到 "),
-                Comp.At(qq=first_player_id),
-                Comp.Plain(text=f" ({game_instance.players[first_player_id].name}) 出牌 (/出牌 编号...)")
-            ]
-            
-            if pm_failed_players:
-                start_message_components.append(Comp.Plain(text=f"\n\n注意：未能成功向以下玩家发送手牌私信：{', '.join(pm_failed_players)}。请检查机器人好友状态或私聊设置。"))
-            
-            await self._reply_with_components(event, start_message_components)
-        
-        async def on_cards_played(game_instance, **kwargs):
-            player_id = kwargs.get('player_id')
-            cards_played = kwargs.get('cards_played')
-            quantity_played = kwargs.get('quantity_played')
-            next_player_id = kwargs.get('next_player_id')
-            player_hand_empty = kwargs.get('player_hand_empty')
-            
-            player_name = game_instance.players[player_id].name
-            next_player_name = game_instance.players[next_player_id].name
-            next_player_hand_empty = not game_instance.players[next_player_id].hand
-            
-            # 构建出牌消息
-            announcement_components = []
-            if player_hand_empty:
-                announcement_components.append(Comp.Plain(text=f"{player_name} 打出了最后 {quantity_played} 张牌！声称是主牌【{game_instance.main_card}】。\n轮到 "))
-            else:
-                announcement_components.append(Comp.Plain(text=f"{player_name} 打出了 {quantity_played} 张牌，声称是主牌【{game_instance.main_card}】。\n轮到 "))
-            
-            announcement_components.append(Comp.At(qq=next_player_id))
-            
-            if next_player_hand_empty:
-                announcement_components.append(Comp.Plain(text=f" ({next_player_name}) 反应 (手牌已空，只能 /质疑 或 /等待)"))
-            else:
-                announcement_components.append(Comp.Plain(text=f" ({next_player_name}) 反应。请选择 /质疑 或 /出牌 <编号...>"))
-            
-            await self._reply_with_components(event, announcement_components)
-            
-            # 向出牌玩家发送手牌更新
-            await self._send_hand_update(event, game_instance.game_id, player_id, game_instance.players[player_id].hand, game_instance.main_card)
-            
-            # 向下一位玩家发送手牌更新
-            if not game_instance.players[next_player_id].is_eliminated:
-                await self._send_hand_update(event, game_instance.game_id, next_player_id, game_instance.players[next_player_id].hand, game_instance.main_card)
-        
-        async def on_challenge_made(game_instance, **kwargs):
-            challenger_id = kwargs.get('challenger_id')
-            challenged_id = kwargs.get('challenged_id')
-            actual_cards = kwargs.get('actual_cards')
-            is_claim_true = kwargs.get('is_claim_true')
-            loser_id = kwargs.get('loser_id')
-            
-            challenger_name = game_instance.players[challenger_id].name
-            challenged_name = game_instance.players[challenged_id].name
-            loser_name = game_instance.players[loser_id].name
-            
-            # 构建质疑消息
-            challenge_message = (
-                f"🤔 {challenger_name} 质疑 {challenged_name} 打出的牌是主牌【{game_instance.main_card}】！\n"
-                f"亮牌结果: 【{' '.join(actual_cards)}】\n"
-            )
-            
-            if is_claim_true:
-                challenge_message += f"❌ 质疑失败！{challenged_name} 确实出的是主牌/鬼牌。{loser_name} 需要开枪！"
-            else:
-                challenge_message += f"✅ 质疑成功！{challenged_name} 没有完全打出主牌或鬼牌。{loser_name} 需要开枪！"
-            
-            await self._reply_text(event, challenge_message)
-        
-        async def on_player_shot(game_instance, **kwargs):
-            player_id = kwargs.get('player_id')
-            is_eliminated = kwargs.get('is_eliminated')
-            
-            player_name = game_instance.players[player_id].name
-            
-            if is_eliminated:
-                await self._reply_text(event, f"{player_name} 扣动扳机... 砰！是【实弹】！{player_name} 被淘汰了！")
-            else:
-                await self._reply_text(event, f"{player_name} 扣动扳机... 咔嚓！是【空弹】！")
-        
-        async def on_player_waited(game_instance, **kwargs):
-            player_id = kwargs.get('player_id')
-            next_player_id = kwargs.get('next_player_id')
-            next_player_hand_empty = kwargs.get('next_player_hand_empty')
-            
-            player_name = game_instance.players[player_id].name
-            next_player_name = game_instance.players[next_player_id].name
-            
-            # 构建等待消息
-            announcement_components = [
-                Comp.Plain(text=f"{player_name} 手牌已空，选择等待。\n轮到 "),
-                Comp.At(qq=next_player_id)
-            ]
-            
-            # 根据下一位玩家手牌情况调整提示
-            if next_player_hand_empty:
-                if game_instance.last_play:
-                    announcement_components.append(Comp.Plain(text=f" ({next_player_name}) 反应 (手牌已空，只能 /质疑 或 /等待)"))
-                else:
-                    announcement_components.append(Comp.Plain(text=f" ({next_player_name}) 出牌 (手牌已空，只能 /等待)"))
-            else:
-                if game_instance.last_play:
-                    announcement_components.append(Comp.Plain(text=f" ({next_player_name}) 反应。请选择 /质疑 或 /出牌 <编号...>"))
-                else:
-                    announcement_components.append(Comp.Plain(text=f" ({next_player_name}) 出牌。请使用 /出牌 <编号...>"))
-            
-            await self._reply_with_components(event, announcement_components)
-            
-            # 向下一位玩家发送手牌更新
-            if not game_instance.players[next_player_id].is_eliminated:
-                await self._send_hand_update(event, game_instance.game_id, next_player_id, game_instance.players[next_player_id].hand, game_instance.main_card)
-        
-        async def on_next_turn(game_instance, **kwargs):
-            player_id = kwargs.get('player_id')
-            player_hand_empty = kwargs.get('player_hand_empty')
-            
-            player_name = game_instance.players[player_id].name
-            
-            # 构建下一轮消息
-            next_turn_components = [
-                Comp.Plain(text="轮到 "),
-                Comp.At(qq=player_id)
-            ]
-            
-            if player_hand_empty:
-                if game_instance.last_play:
-                    next_turn_components.append(Comp.Plain(text=f" ({player_name}) 反应 (手牌已空，只能 /质疑 或 /等待)"))
-                else:
-                    next_turn_components.append(Comp.Plain(text=f" ({player_name}) 出牌 (手牌已空，只能 /等待)"))
-            else:
-                if game_instance.last_play:
-                    next_turn_components.append(Comp.Plain(text=f" ({player_name}) 反应。请选择 /质疑 或 /出牌 <编号...>"))
-                else:
-                    next_turn_components.append(Comp.Plain(text=f" ({player_name}) 出牌。请使用 /出牌 <编号...>"))
-            
-            await self._reply_with_components(event, next_turn_components)
-            
-            # 向玩家发送手牌更新
-            if not game_instance.players[player_id].is_eliminated:
-                await self._send_hand_update(event, game_instance.game_id, player_id, game_instance.players[player_id].hand, game_instance.main_card)
-        
-        async def on_reshuffled(game_instance, **kwargs):
-            reason = kwargs.get('reason')
-            main_card = kwargs.get('main_card')
-            start_player_id = kwargs.get('start_player_id')
-            
-            # 发送手牌给所有活跃玩家
-            pm_failed_players = []
-            for player_id in game_instance.get_active_players():
-                if not await self._send_hand_update(event, game_instance.game_id, player_id, game_instance.players[player_id].hand, main_card):
-                    pm_failed_players.append(game_instance.players[player_id].name)
-            
-            # 构建重洗消息
-            turn_order_display = []
-            for p_id in game_instance.turn_order:
-                p_name = game_instance.players[p_id].name
-                status = " (淘汰)" if game_instance.players[p_id].is_eliminated else ""
-                turn_order_display.append(f"{p_name}{status}")
-            
-            start_player_name = game_instance.players[start_player_id].name
-            
-            start_message_components = [
-                Comp.Plain(text=f"🔄 新一轮开始 ({reason})！\n"
-                          f"👑 新主牌: {main_card}\n"
-                          f"📜 顺序: {', '.join(turn_order_display)}\n"
-                          f"(新手牌已私信发送)\n"
-                          f"👉 轮到 "),
-                Comp.At(qq=start_player_id),
-                Comp.Plain(text=f" ({start_player_name}) 出牌。")
-            ]
-            
-            if pm_failed_players:
-                start_message_components.append(Comp.Plain(text=f"\n\n注意：未能成功向以下玩家发送手牌私信：{', '.join(pm_failed_players)}。请检查机器人好友状态或私聊设置。"))
-            
-            await self._reply_with_components(event, start_message_components)
-        
-        async def on_game_ended(game_instance, **kwargs):
-            winner_id = kwargs.get('winner_id')
-            winner_name = kwargs.get('winner_name')
-            forced = kwargs.get('forced', False)
-            
-            if forced:
-                await self._reply_text(event, "当前群聊的骗子酒馆游戏已被强制结束。")
-            else:
-                await self._reply_text(event, f"🎉 游戏结束！胜者: {winner_name}！")
-        
-        # 注册所有回调
-        game.register_callback(GameEvent.PLAYER_JOINED, on_player_joined)
-        game.register_callback(GameEvent.GAME_STARTED, on_game_started)
-        game.register_callback(GameEvent.CARDS_PLAYED, on_cards_played)
-        game.register_callback(GameEvent.CHALLENGE_MADE, on_challenge_made)
-        game.register_callback(GameEvent.PLAYER_SHOT, on_player_shot)
-        game.register_callback(GameEvent.PLAYER_WAITED, on_player_waited)
-        game.register_callback(GameEvent.NEXT_TURN, on_next_turn)
-        game.register_callback(GameEvent.RESHUFFLED, on_reshuffled)
-        game.register_callback(GameEvent.GAME_ENDED, on_game_ended)
-
-    # --- 命令处理函数 ---
-    @filter.command("骗子酒馆")
+    @filter.command("骗子酒馆", alias={'pzjg', 'liardice'})
     async def create_game(self, event: AstrMessageEvent):
+        '''创建一局新的骗子酒馆游戏'''
         group_id = self._get_group_id(event)
         if not group_id:
-            await self._reply_text(event, "请在群聊中使用此命令")
-            event.stop_event()
+            user_id = self._get_user_id(event)
+            if user_id: await self._send_private_message_text(event, user_id, "请在群聊中使用此命令创建游戏。")
+            else: logger.warning("Command used outside group, no user ID.")
+            if not event.is_stopped(): event.stop_event()
             return
-        
-        if group_id in self.games and self.games[group_id].state != GameState.ENDED:
-            await self._reply_text(event, "本群已有一个骗子酒馆游戏正在进行中 (使用 /结束游戏 可强制结束)")
-            event.stop_event()
-            return
-        
-        # 创建新游戏实例
-        game = LiarsTavernGame(group_id)
-        self.games[group_id] = game
-        
-        # 注册事件回调
-        self._register_game_callbacks(game, event)
-        
-        logger.info(f"[群{group_id}] 骗子酒馆 (左轮扑克模式) 游戏已创建")
-        await self._reply_text(event, f"骗子酒馆开张了！\n➡️ 输入 /加入 参与 (至少 {game.config.MIN_PLAYERS} 人)。\n➡️ 发起者输入 /开始 启动游戏。\n\n📜 玩法: 轮流用 /出牌 编号 (1-3张) 声称是主牌，下家可 /质疑 或继续 /出牌。")
-        event.stop_event()
-        return
+        if group_id in self.games:
+            game_instance = self.games.get(group_id); current_status = game_instance.state.status if game_instance else GameStatus.ENDED
+            if current_status != GameStatus.ENDED: status_name = current_status.name; yield event.plain_result(f"⏳ 本群已有一局游戏 ({status_name})。\n➡️ /结束游戏 可强制结束。"); event.stop_event(); return
+            else: del self.games[group_id]; logger.info(f"[群{group_id}] Removed ended game before creating new.")
+        creator_id = self._get_user_id(event); self.games[group_id] = LiarDiceGame(creator_id=creator_id); logger.info(f"[群{group_id}] New game created by {creator_id}.")
+        announcement = (f"🍻 骗子酒馆开张了！(左轮扑克版 v1.1)\n➡️ 输入 /加入 参与 (至少需 {MIN_PLAYERS} 人)。\n➡️ 发起者 ({event.get_sender_name()}) 输入 /开始 启动游戏。\n\n📜 玩法:\n1. 轮流用 `/出牌 编号 [编号...]` (1-{MAX_PLAY_CARDS}张) 声称打出【主牌】。\n2. 下家可 `/质疑` 或继续 `/出牌`。\n3. 质疑失败或声称不实，都要开枪！\n4. 手牌为空时，只能 `/质疑` 或 `/等待`。\n5. 活到最后即胜！(淘汰或全员空手牌时会重洗)"); yield event.plain_result(announcement); event.stop_event(); return
 
     @filter.command("加入")
     async def join_game(self, event: AstrMessageEvent):
-        group_id = self._get_group_id(event)
-        user_id = self._get_user_id(event)
-        user_name = event.get_sender_name()
-        
-        if not group_id or not user_id:
-            await self._reply_text(event, "无法识别命令来源")
-            event.stop_event()
-            return
-        
-        game = self.games.get(group_id)
-        if not game:
-            await self._reply_text(event, "本群当前没有进行中的游戏")
-            event.stop_event()
-            return
-        
-        try:
-            game.add_player(user_id, user_name)
-            # 注意：加入成功的消息由事件回调处理
-        except GameError as e:
-            await self._reply_text(event, str(e))
-        except InvalidPlayerError as e:
-            await self._reply_text(event, str(e))
-        except Exception as e:
-            logger.error(f"加入游戏时发生错误: {e}", exc_info=True)
-            await self._reply_text(event, f"加入游戏时发生错误: {e}")
-        
-        event.stop_event()
-        return
+        '''加入等待中的骗子酒馆游戏'''
+        group_id = self._get_group_id(event); user_id = self._get_user_id(event); user_name = event.get_sender_name()
+        if not group_id or not user_id: yield event.plain_result("❌ 无法识别命令来源。"); event.stop_event(); return
+        if group_id not in self.games: yield event.plain_result("ℹ️ 本群当前没有游戏。输入 /骗子酒馆 创建。"); event.stop_event(); return
+        game_instance = self.games[group_id]
+        try: game_instance.add_player(user_id, user_name); player_count = len(game_instance.state.players); yield event.chain_result(build_join_message(user_id, user_name, player_count))
+        except GameError as e: yield event.plain_result(f"⚠️ 加入失败: {e}")
+        except Exception as e: logger.error(f"[群{group_id}] Join error: {e}", exc_info=True); yield event.plain_result("❌ 处理加入命令时发生内部错误。")
+        if not event.is_stopped(): event.stop_event(); return
 
     @filter.command("开始")
     async def start_game(self, event: AstrMessageEvent):
-        group_id = self._get_group_id(event)
-        if not group_id:
-            await self._reply_text(event, "请在群聊中使用此命令")
-            event.stop_event()
-            return
-        
-        game = self.games.get(group_id)
-        if not game:
-            await self._reply_text(event, "本群当前没有进行中的游戏")
-            event.stop_event()
-            return
-        
+        '''开始一局骗子酒馆游戏 (需要足够玩家)'''
+        group_id = self._get_group_id(event); user_id = self._get_user_id(event)
+        if not group_id: yield event.plain_result("❌ 请在群聊中开始游戏。"); event.stop_event(); return
+        if group_id not in self.games: yield event.plain_result("ℹ️ 本群当前没有游戏。"); event.stop_event(); return
+        game_instance = self.games[group_id]
+        # if game_instance.state.creator_id and user_id != game_instance.state.creator_id: yield event.plain_result("❌ 只有游戏发起者才能开始。"); event.stop_event(); return
+        if len(game_instance.state.players) < MIN_PLAYERS: yield event.plain_result(f"❌ 至少需要 {MIN_PLAYERS} 人开始，当前 {len(game_instance.state.players)} 人。"); event.stop_event(); return
+        pm_failures_details = []
         try:
-            game.start_game()
-            # 注意：游戏开始的消息由事件回调处理
-        except GameError as e:
-            await self._reply_text(event, str(e))
-        except Exception as e:
-            logger.error(f"开始游戏时发生错误: {e}", exc_info=True)
-            await self._reply_text(event, f"开始游戏时发生错误: {e}")
-        
-        event.stop_event()
-        return
+            start_result = game_instance.start_game()
+            if not start_result or not start_result.get("success"): error_msg = start_result.get("error", "未知错误"); yield event.plain_result(f"❌ 启动失败: {error_msg}"); event.stop_event(); return
+            initial_hands = start_result.get("initial_hands", {}); main_card = start_result.get("main_card")
+            for p_id, hand in initial_hands.items():
+                if not await self._send_hand_update(event, group_id, p_id, hand, main_card):
+                    player_data = game_instance.state.players.get(p_id); failed_name = player_data.name if player_data else p_id; pm_failures_details.append({'id': p_id, 'name': failed_name})
+            yield event.chain_result(build_start_game_message(start_result, []))
+            if pm_failures_details:
+                failed_mentions = []
+                # --- MODIFICATION START: Fixed semicolon and multiline logic ---
+                for i, detail in enumerate(pm_failures_details):
+                    failed_mentions.extend([Comp.At(qq=detail['id']), Comp.Plain(text=f"({detail['name']})")])
+                    # 在名字后面加上逗号，除了最后一个
+                    if i < len(pm_failures_details) - 1:
+                        failed_mentions.append(Comp.Plain(text=", "))
+                # --- MODIFICATION END ---
+                yield event.chain_result([Comp.Plain("⚠️ 未能向 ")] + failed_mentions + [Comp.Plain(" 发送初始手牌私信。")])
+        except GameError as e: yield event.plain_result(f"⚠️ 启动失败: {e}")
+        except Exception as e: logger.error(f"[群{group_id}] Start game error: {e}", exc_info=True); yield event.plain_result("❌ 处理开始命令时发生内部错误。")
+        if not event.is_stopped(): event.stop_event(); return
 
-    @filter.command("出牌")
+    @filter.command("出牌", alias={'play', '打出'})
     async def play_cards(self, event: AstrMessageEvent):
-        group_id = self._get_group_id(event)
-        player_id = self._get_user_id(event)
-        
-        if not group_id or not player_id:
-            await self._reply_text(event, "无法识别命令来源")
-            event.stop_event()
-            return
-        
-        game = self.games.get(group_id)
-        if not game or game.state != GameState.PLAYING:
-            await self._reply_text(event, "现在不是进行游戏的时间")
-            event.stop_event()
-            return
-        
-        # 解析参数
+        '''打出手牌 (1-3张)，声称是主牌。用法: /出牌 编号 [编号...]'''
+        group_id = self._get_group_id(event); player_id = self._get_user_id(event)
+        if not group_id or not player_id: yield event.plain_result("❌ 无法识别命令来源。"); event.stop_event(); return
+        if group_id not in self.games: yield event.plain_result("ℹ️ 本群当前没有游戏。"); event.stop_event(); return
+        game_instance = self.games[group_id]
+        card_indices_1based = []; parse_error = None
         try:
-            if not hasattr(event, 'message_str'):
-                logger.error("事件对象缺少 message_str 属性！")
-                await self._reply_text(event, "无法解析命令参数。")
-                event.stop_event()
-                return
-            
-            args_text = event.message_str.strip()
-            indices_1based_str = re.findall(r'\d+', args_text)
-            
-            if not indices_1based_str:
-                raise ValueError("请用 /出牌 编号 [编号...] (例: /出牌 1 3)")
-            
-            indices_1based = [int(idx_str) for idx_str in indices_1based_str]
-            
-            # 执行出牌
-            game.play_cards(player_id, indices_1based)
-            # 注意：出牌结果的消息由事件回调处理
-            
-        except ValueError as e:
-            await self._reply_text(event, f"❌ 命令错误: {e}\n👉 请用 /出牌 编号 [编号...] (例: /出牌 1 3)")
-        except InvalidPlayerError as e:
-            await self._reply_text(event, f"❌ {e}")
-        except InvalidActionError as e:
-            await self._reply_text(event, f"❌ {e}")
-        except GameError as e:
-            await self._reply_text(event, f"❌ {e}")
-        except Exception as e:
-            logger.error(f"处理出牌命令时发生错误: {e}", exc_info=True)
-            await self._reply_text(event, f"❌ 处理出牌命令时发生内部错误，请检查日志或联系管理员。")
-        
-        event.stop_event()
-        return
+            full_message = event.message_str.strip(); match = re.match(r'^\S+\s+(.*)', full_message); param_part = match.group(1) if match else ""
+            if not param_part: parse_error = f"请提供编号 (1-{MAX_PLAY_CARDS}个)。用法: /出牌 编号 [...]" if re.match(r'^\S+$', full_message) else "未提供有效编号。"
+            # --- MODIFICATION START: Fixed semicolon and multiline logic ---
+            else:
+                indices_str = re.findall(r'\d+', param_part)
+                card_indices_1based = [int(s) for s in indices_str] if indices_str else []
+                # 检查解析后是否真的得到了编号
+                if not card_indices_1based:
+                    parse_error = "未在指令后找到有效的数字编号。"
+            # --- MODIFICATION END ---
+        except Exception as parse_ex: logger.error(f"[群{group_id}] Parse play param error: {parse_ex}"); parse_error = "解析参数出错。"
+        if parse_error: yield event.plain_result(f"❌ 命令错误: {parse_error}"); event.stop_event(); return
 
-    @filter.command("质疑")
+        yielded_something = False
+        handler_name = "play_cards"
+        try:
+            result = game_instance.process_play_card(player_id, card_indices_1based)
+            message_lists_to_yield = await self._handle_game_result(event, group_id, result)
+            if message_lists_to_yield:
+                for msg_comps in message_lists_to_yield:
+                    if msg_comps: yield event.chain_result(msg_comps); yielded_something = True
+        except GameError as e:
+            error_string = build_error_message(e, game_instance, player_id)
+            yield event.plain_result(error_string); yielded_something = True
+        except Exception as e:
+            logger.error(f"[群{group_id}] Process play error: {e}", exc_info=True); error_string = build_error_message(e); yield event.plain_result(error_string); yielded_something = True
+        finally:
+            if not yielded_something: logger.debug(f"Handler '{handler_name}' completed without yielding."); yield event.make_result()
+        if not event.is_stopped(): event.stop_event(); return
+
+    @filter.command("质疑", alias={'challenge', '抓'})
     async def challenge_play(self, event: AstrMessageEvent):
-        group_id = self._get_group_id(event)
-        challenger_id = self._get_user_id(event)
-        
-        if not group_id or not challenger_id:
-            await self._reply_text(event, "❌ 无法识别命令来源")
-            event.stop_event()
-            return
-        
-        game = self.games.get(group_id)
-        if not game or game.state != GameState.PLAYING:
-            await self._reply_text(event, "现在不是进行游戏的时间")
-            event.stop_event()
-            return
-        
+        '''质疑上一个玩家打出的牌是否符合声称'''
+        group_id = self._get_group_id(event); player_id = self._get_user_id(event)
+        if not group_id or not player_id: yield event.plain_result("❌ 无法识别命令来源。"); event.stop_event(); return
+        if group_id not in self.games: yield event.plain_result("ℹ️ 本群当前没有游戏。"); event.stop_event(); return
+        game_instance = self.games[group_id]
+        yielded_something = False
+        handler_name = "challenge_play"
         try:
-            game.challenge(challenger_id)
-            # 注意：质疑结果的消息由事件回调处理
-        except InvalidPlayerError as e:
-            await self._reply_text(event, f"❌ {e}")
-        except InvalidActionError as e:
-            await self._reply_text(event, f"❌ {e}")
+            result = game_instance.process_challenge(player_id)
+            message_lists_to_yield = await self._handle_game_result(event, group_id, result)
+            if message_lists_to_yield:
+                for msg_comps in message_lists_to_yield:
+                    if msg_comps: yield event.chain_result(msg_comps); yielded_something = True
         except GameError as e:
-            await self._reply_text(event, f"❌ {e}")
+            error_string = build_error_message(e, game_instance, player_id)
+            yield event.plain_result(error_string); yielded_something = True
         except Exception as e:
-            logger.error(f"处理质疑命令时发生错误: {e}", exc_info=True)
-            await self._reply_text(event, f"❌ 处理质疑命令时发生内部错误，请检查日志或联系管理员。")
-        
-        event.stop_event()
-        return
+            logger.error(f"[群{group_id}] Process challenge error: {e}", exc_info=True); error_string = build_error_message(e); yield event.plain_result(error_string); yielded_something = True
+        finally:
+             if not yielded_something: logger.debug(f"Handler '{handler_name}' completed without yielding."); yield event.make_result()
+        if not event.is_stopped(): event.stop_event(); return
 
-    @filter.command("等待")
+    @filter.command("等待", alias={'wait', 'pass', '过'})
     async def wait_turn(self, event: AstrMessageEvent):
-        """处理玩家选择等待的操作 (仅限手牌为空时)"""
-        group_id = self._get_group_id(event)
-        player_id = self._get_user_id(event)
-        
-        if not group_id or not player_id:
-            await self._reply_text(event, "无法识别命令来源")
-            event.stop_event()
-            return
-        
-        game = self.games.get(group_id)
-        if not game or game.state != GameState.PLAYING:
-            await self._reply_text(event, "现在不是进行游戏的时间")
-            event.stop_event()
-            return
-        
+        '''手牌为空时选择等待，跳过自己的回合'''
+        group_id = self._get_group_id(event); player_id = self._get_user_id(event)
+        if not group_id or not player_id: yield event.plain_result("❌ 无法识别命令来源。"); event.stop_event(); return
+        if group_id not in self.games: yield event.plain_result("ℹ️ 本群当前没有游戏。"); event.stop_event(); return
+        game_instance = self.games[group_id]
+        yielded_something = False
+        handler_name = "wait_turn"
         try:
-            game.wait_turn(player_id)
-            # 注意：等待结果的消息由事件回调处理
-        except InvalidPlayerError as e:
-            await self._reply_text(event, f"❌ {e}")
-        except InvalidActionError as e:
-            await self._reply_text(event, f"❌ {e}")
+            result = game_instance.process_wait(player_id)
+            message_lists_to_yield = await self._handle_game_result(event, group_id, result)
+            if message_lists_to_yield:
+                for msg_comps in message_lists_to_yield:
+                    if msg_comps: yield event.chain_result(msg_comps); yielded_something = True
         except GameError as e:
-            await self._reply_text(event, f"❌ {e}")
+            error_string = build_error_message(e, game_instance, player_id)
+            yield event.plain_result(error_string); yielded_something = True
         except Exception as e:
-            logger.error(f"处理等待命令时发生错误: {e}", exc_info=True)
-            await self._reply_text(event, f"❌ 处理等待命令时发生内部错误，请检查日志或联系管理员。")
-        
-        event.stop_event()
-        return
+            logger.error(f"[群{group_id}] Process wait error: {e}", exc_info=True); error_string = build_error_message(e); yield event.plain_result(error_string); yielded_something = True
+        finally:
+             if not yielded_something: logger.debug(f"Handler '{handler_name}' completed without yielding."); yield event.make_result()
+        if not event.is_stopped(): event.stop_event(); return
 
-    @filter.command("状态")
+    @filter.command("状态", alias={'status', '游戏状态'})
     async def game_status(self, event: AstrMessageEvent):
-        group_id = self._get_group_id(event)
-        user_id = self._get_user_id(event)
-        
-        if not group_id:
-            await self._reply_text(event, "请在群聊中使用此命令")
-            event.stop_event()
-            return
-        
-        game = self.games.get(group_id)
-        if not game or game.state == GameState.ENDED:
-            await self._reply_text(event, "本群当前没有进行中的骗子酒馆游戏")
-            event.stop_event()
-            return
-        
-        if game.state == GameState.WAITING:
-            player_list = "\n".join([f"- {player.name}" for player in game.players.values()]) or "暂无玩家加入"
-            await self._reply_text(event, f"⏳ 游戏状态: 等待中\n玩家 ({len(game.players)}人):\n{player_list}\n\n➡️ 发起者输入 /开始 (至少 {game.config.MIN_PLAYERS} 人)")
-            event.stop_event()
-            return
-        
-        # 获取游戏状态信息
-        status = game.get_game_status()
-        
-        # 构建状态消息
-        status_components = [
-            Comp.Plain(text=f"游戏状态：进行中\n主牌: 【{game.main_card}】\n出牌顺序: {', '.join([game.players[pid].name for pid in game.turn_order])}\n当前轮到: ")
-        ]
-        
-        if 'current_player' in status:
-            status_components.append(Comp.At(qq=status['current_player']['id']))
-            status_components.append(Comp.Plain(text=f" ({status['current_player']['name']})"))
-        else:
-            status_components.append(Comp.Plain(text="未知"))
-        
-        # 玩家状态
-        player_statuses = []
-        for pid, pdata in status['players'].items():
-            player_statuses.append(f"- {pdata['name']}: {'淘汰' if pdata['is_eliminated'] else str(pdata['hand_size']) + '张牌'}")
-        
-        # 上一轮出牌信息
-        last_play_text = "无"
-        if 'last_play' in status:
-            last_player_name = status['last_play']['player_name']
-            claimed_quantity = status['last_play']['claimed_quantity']
-            last_play_text = f"{last_player_name} 声称打出 {claimed_quantity} 张主牌【{game.main_card}】"
-            if 'current_player' in status:
-                last_play_text += f" (等待 {status['current_player']['name']} 反应)"
-        
-        status_components.extend([
-            Comp.Plain(text=f"\n--------------------\n玩家状态:\n" + "\n".join(player_statuses) + "\n"
-                          f"--------------------\n等待处理的出牌: {last_play_text}\n"
-                          f"弃牌堆: {len(game.discard_pile)}张 | 牌堆剩余: 约{len(game.deck)}张")
-        ])
-        
-        # 如果是当前玩家查询，显示手牌
-        if user_id and user_id in game.players and not game.players[user_id].is_eliminated:
-            my_hand = game.players[user_id].hand
-            my_hand_display = self.message_formatter.format_hand_for_display(my_hand)
-            status_components.append(Comp.Plain(text=f"\n--------------------\n你的手牌: {my_hand_display}"))
-        
-        await self._reply_with_components(event, status_components)
-        event.stop_event()
-        return
+        '''查看当前游戏状态和玩家信息'''
+        group_id = self._get_group_id(event); player_id = self._get_user_id(event)
+        if not group_id: yield event.plain_result("请在群聊中使用此命令。"); event.stop_event(); return
+        if group_id not in self.games: yield event.plain_result("ℹ️ 本群当前没有进行中的游戏。"); event.stop_event(); return
+        game_instance = self.games[group_id]
+        try: yield event.chain_result(build_game_status_message(game_instance.state, player_id))
+        except Exception as e: logger.error(f"[群{group_id}] Get status error: {e}", exc_info=True); yield event.plain_result("❌ 获取状态时发生内部错误。")
+        if not event.is_stopped(): event.stop_event(); return
 
-    @filter.command("我的手牌")
+    @filter.command("我的手牌", alias={'hand', '手牌'})
     async def show_my_hand(self, event: AstrMessageEvent):
-        group_id = self._get_group_id(event)
-        user_id = self._get_user_id(event)
-        
-        if not group_id or not user_id:
-            await self._reply_text(event, "无法识别命令来源")
-            event.stop_event()
-            return
-        
-        game = self.games.get(group_id)
-        if not game or game.state != GameState.PLAYING:
-            await self._reply_text(event, "现在不是进行游戏的时间")
-            event.stop_event()
-            return
-        
-        if user_id not in game.players or game.players[user_id].is_eliminated:
-            await self._reply_text(event, "你不在游戏中或已被淘汰。")
-            event.stop_event()
-            return
-        
-        my_hand = game.players[user_id].hand
-        main_card = game.main_card
-        
-        # 使用手牌更新方法
+        '''私信查看你当前的手牌'''
+        group_id = self._get_group_id(event); user_id = self._get_user_id(event)
+        if not group_id or not user_id: yield event.plain_result("❌ 无法识别命令来源。"); event.stop_event(); return
+        if group_id not in self.games: yield event.plain_result("ℹ️ 本群当前没有进行中的游戏。"); event.stop_event(); return
+        game_instance = self.games[group_id]
+        player_data = game_instance.state.players.get(user_id)
+        if not player_data: yield event.plain_result("ℹ️ 你似乎未参与本局游戏。"); event.stop_event(); return
+        if player_data.is_eliminated: yield event.plain_result("☠️ 你已被淘汰，没有手牌了。"); event.stop_event(); return
+        my_hand = player_data.hand; main_card = game_instance.state.main_card
         success = await self._send_hand_update(event, group_id, user_id, my_hand, main_card)
-        if success:
-            await self._reply_text(event, "已通过私信将你的手牌发送给你，请查收。")
-        else:
-            # 如果私聊失败，则在群里回复（注意隐私风险）
-            my_hand_display = self.message_formatter.format_hand_for_display(my_hand)
-            await self._reply_text(event, f"你的手牌: {my_hand_display}\n本轮主牌: 【{main_card}】\n(私信发送失败，已在群内显示)")
-        
-        event.stop_event()
-        return
+        if success: yield event.plain_result("🤫 已私信发送你的最新手牌，请查收。")
+        else: my_hand_display = format_hand(my_hand); yield event.chain_result([ Comp.At(qq=user_id), Comp.Plain(text=f"，私信发送失败！\n你的手牌: {my_hand_display}\n👑 主牌: 【{main_card or '未定'}】") ])
+        if not event.is_stopped(): event.stop_event(); return
 
-    @filter.command("结束游戏")
+    @filter.command("结束游戏", alias={'endgame', '强制结束'})
     async def force_end_game(self, event: AstrMessageEvent):
-        group_id = self._get_group_id(event)
-        
-        if not group_id:
-            await self._reply_text(event, "请在群聊中使用此命令")
-            event.stop_event()
-            return
-        
-        game = self.games.get(group_id)
-        if game:
-            game.force_end()
-            # 游戏结束的消息由事件回调处理
-            
-            # 清理游戏实例
-            if game.state == GameState.ENDED:
-                del self.games[group_id]
-        else:
-            await self._reply_text(event, "本群当前没有进行中的骗子酒馆游戏。")
-        
-        event.stop_event()
-        return
+        '''强制结束当前群聊的游戏'''
+        group_id = self._get_group_id(event); user_id = self._get_user_id(event); user_name = event.get_sender_name()
+        if not group_id: yield event.plain_result("请在群聊中使用此命令。"); event.stop_event(); return
+        if group_id in self.games:
+            game_instance = self.games.pop(group_id); game_status = game_instance.state.status.name if game_instance else '未知'
+            logger.info(f"[群{group_id}] Game force ended by {user_name}({user_id}) (was {game_status})")
+            yield event.plain_result("🛑 当前群聊的骗子酒馆游戏已被强制结束。")
+        else: yield event.plain_result("ℹ️ 本群当前没有进行中的游戏。")
+        if not event.is_stopped(): event.stop_event(); return
 
+    # --- Plugin Lifecycle ---
     async def terminate(self):
-        logger.info("骗子酒馆插件卸载/停用，清理所有游戏数据...")
-        
-        # 强制结束所有游戏
-        for group_id, game in list(self.games.items()):
-            game.force_end()
-        
-        self.games = {}
-        logger.info("所有游戏数据已清理")
+        logger.info("骗子酒馆插件 (重构版) 卸载/停用，清理所有游戏数据...")
+        self.games.clear(); logger.info("所有游戏数据已清理")
