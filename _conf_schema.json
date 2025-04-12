@@ -1,0 +1,25 @@
+{
+    "enable_trash_talk": {
+        "type": "bool",
+        "default": true,
+        "description": "是否启用 AI 玩家回合前的“嘴炮”功能。"
+    },
+    "trash_talk_style_prompt": {
+        "type": "string",
+        "default": "简短、幽默且略带挑衅。可以根据聊天记录和游戏情况嘲讽对手或吹嘘自己。",
+        "description": "AI 生成“嘴炮”时遵循的风格指示（会加入到给 LLM 的提示词中）。",
+        "hint": "例如：'扮演一个爱说怪话的酒馆老油条' 或 '模仿猫娘的口癖，用卡哇伊的方式嘲讽对手，喵~'"
+    },
+    "recent_chat_history_length": {
+        "type": "int",
+        "default": 10,
+        "description": "AI 分析时考虑最近多少条群聊天记录。",
+        "hint": "设置过大可能导致 Prompt 过长或 LLM 处理变慢。"
+    },
+    "include_chat_in_action_prompt": {
+        "type": "bool",
+        "default": true,
+        "description": "是否在请求 AI 做游戏决策（出牌/质疑/等待）的 Prompt 中也包含聊天记录。",
+        "hint": "开启可能让 AI 决策更智能，但也可能增加 Prompt 长度和 LLM 成本。"
+    }
+}

@@ -1,10 +1,10 @@
 # Plugin metadata for AstrBot liar_dice_game
-id: liar_dice_game          # Unique plugin ID (must match @register)
-name: "骗子酒馆"             # Display name in UI
-author: "YourName"           # Your GitHub ID or Nickname
-version: "1.1.0"           # Plugin version (must match @register in main.py)
-description: "一个结合了吹牛和左轮扑克的多人卡牌游戏插件 (重构版)。" # Short description
-repo: "your_repo_url"      # Optional: Link to your plugin's Git repository
-tags: ["game", "multiplayer", "card game", "fun", "游戏"] # Example tags
-license: "MIT" # Example license
+id: liar_dice_game
+name: "骗子酒馆"
+author: "YourName_AI"
+version: "1.3.1" # <-- 版本号提升
+description: "一个结合了吹牛和左轮扑克的多人卡牌游戏插件 (含AI玩家和聊天互动)。" # 更新描述
+repo: "your_repo_url"
+tags: ["game", "multiplayer", "card game", "fun", "ai", "llm", "游戏", "AI玩家", "聊天互动"] # 添加标签
+license: "MIT"
 # icon_url: ""
