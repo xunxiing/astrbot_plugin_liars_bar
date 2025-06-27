@@ -38,6 +38,12 @@ from .message_utils import (
     build_game_status_message, build_game_end_message,
     build_error_message
 )
+from .workflow_adapter import (
+    WorkflowData,
+    WorkflowSession,
+    WorkflowRun,
+    WorkflowEngine,
+)
 
 # --- Logger Setup ---
 logger = logging.getLogger(__name__)
@@ -592,5 +598,30 @@ class LiarDicePlugin(Star):
         if active_tasks: logger.info(f"取消{len(active_tasks)}个AI任务..."); [t.cancel() for t in active_tasks if not t.done()]; self.active_ai_tasks.clear(); logger.info("AI任务已取消。")
         if self.games: logger.info(f"清理{len(self.games)}个游戏实例..."); self.games.clear(); logger.info("游戏实例数据已清理。")
         logger.info("清理完成。")
+
+    # --- Workflow Support ---
+    def build_workflow(self) -> WorkflowData:
+        """Return a simple workflow definition for the upcoming workflow engine."""
+
+        async def start_node(session: WorkflowSession, event: AstrMessageEvent):
+            return "handle_event"
+
+        async def handle_event(session: WorkflowSession, event: AstrMessageEvent):
+            await self._record_group_chat(event)
+            return "end"
+
+        async def end_node(session: WorkflowSession, event: AstrMessageEvent):
+            return None
+
+        return WorkflowData(
+            name="liar_tavern",
+            nodes={
+                "start": start_node,
+                "handle_event": handle_event,
+                "end": end_node,
+            },
+            start="start",
+            end="end",
+        )
 
 # --- End of LiarDicePlugin Class ---

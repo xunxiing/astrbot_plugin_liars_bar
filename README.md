@@ -1,9 +1,11 @@
 # AstrBot 插件：骗子酒馆 (Liar's Tavern - Revolver Poker AI Mode)
 
-**版本:** 1.2.0
+**版本:** 1.3.6
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 一款结合了吹牛、扑克元素和刺激左轮淘汰机制的多人在线卡牌游戏插件，专为 AstrBot 设计。现在支持添加 AI 玩家与你对战！在酒馆里，你需要胆识和策略才能生存下来！
+
+自 v1.3.6 起，插件内置了面向 AstrBot **workflow** 模式的实验性支持，未来可在新架构下获得更灵活的会话管理能力。
 
 ## 游戏玩法
 
