@@ -4,7 +4,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 一款结合了吹牛、扑克元素和刺激左轮淘汰机制的多人在线卡牌游戏插件，专为 AstrBot 设计。现在支持添加 AI 玩家与你对战！在酒馆里，你需要胆识和策略才能生存下来！
-
+由于作者学业问题，本仓库停止维护
 ## 游戏玩法
 
 1.  **开局**: 玩家们（包括人类和 AI）加入游戏，系统会确定一个本轮的“主牌”(A, K, 或 Q 中的一种)。
@@ -92,10 +92,6 @@
 1.  将插件文件夹 `astrbot_plugin_liar_tavern` 放置于 AstrBot 的 `data/plugins` 目录下。
 2.  重启 AstrBot 或在插件管理界面重新加载插件。
 3.  (如果插件有额外依赖) 根据 `requirements.txt` 安装依赖：`pip install -r requirements.txt` (本插件目前似乎没有外部依赖)。
-
-## 贡献
-
-欢迎通过提 Issue 或 Pull Request (如果提供了仓库链接) 的方式贡献代码、报告 Bug 或提出建议。
 
 ## 许可证
 
